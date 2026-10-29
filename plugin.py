@@ -7,6 +7,8 @@
 - 白名单群：插件对入站消息完全不做处理，Maisaka 走原生逻辑（含主动回复）。
 - 白名单可在群内用 @麦麦 /on、/off 切换，也可在 WebUI 页面增删，两者共享同一份数据；
   谁能执行命令由 ``permission.mode``（all / admin）与 ``permission.admins`` 决定。
+- ``auto_off.hours`` > 0 时，``/on`` 加入的群会在到期后自动移出白名单，并向群里发送
+  ``auto_off.reply_auto_closed``；默认 0 表示永不自动关闭。
 
 实现要点：
 - 丢弃只能发生在 Hook 阶段：abort 发生在 ``chat_manager.register_message`` 与文件入库之前，
@@ -48,6 +50,8 @@ PLUGIN_ID = "github.natsuyutori.wake-up-maimai"
 STATE_VERSION = 1
 WHITELIST_FILENAME = "whitelist.json"
 CONTEXT_CACHE_FILENAME = "context_cache.json"
+# 自动关闭检查间隔（秒）
+AUTO_OFF_CHECK_INTERVAL_SECONDS = 30.0
 
 # 注入内容默认前缀；支持 {count}（条数）与 {omitted}（省略提示）两个占位符
 DEFAULT_CONTEXT_PREFIX = "【群聊最近 {count} 条消息（插件缓存，按时间正序）】{omitted}"
@@ -608,12 +612,35 @@ class CommandSectionConfig(PluginConfigBase):
     )
 
 
+class AutoOffSectionConfig(PluginConfigBase):
+    """自动关闭配置：/on 之后到点自动 /off。"""
+
+    __ui_label__ = "自动关闭"
+    __ui_icon__ = "timer"
+    __ui_order__ = 3
+
+    hours: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=8760.0,
+        description=(
+            "用 @麦麦 /on 把群加入白名单后，多少小时自动移出白名单并停止自动回复。"
+            "默认 0 = 永不自动关闭，只能手动 /off。"
+        ),
+    )
+    reply_auto_closed: str = Field(
+        default="自动回复时间到啦，本群现在恢复「只回复 @」模式；想继续自动回复就再 @我 /on 一下。",
+        max_length=500,
+        description="自动关闭时向该群发送的消息。留空则不发送提示。",
+    )
+
+
 class PermissionSectionConfig(PluginConfigBase):
     """命令权限配置。"""
 
     __ui_label__ = "命令权限"
     __ui_icon__ = "lock"
-    __ui_order__ = 3
+    __ui_order__ = 4
 
     mode: str = Field(
         default="all",
@@ -648,7 +675,7 @@ class ReplySectionConfig(PluginConfigBase):
 
     __ui_label__ = "强制回复"
     __ui_icon__ = "reply"
-    __ui_order__ = 4
+    __ui_order__ = 5
 
     force: bool = Field(
         default=True,
@@ -687,7 +714,7 @@ class AtDetectionSectionConfig(PluginConfigBase):
 
     __ui_label__ = "判定与兼容"
     __ui_icon__ = "scan-eye"
-    __ui_order__ = 5
+    __ui_order__ = 6
 
     unresolved: str = Field(
         default="drop",
@@ -704,6 +731,7 @@ class AtGateConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     context: ContextSectionConfig = Field(default_factory=ContextSectionConfig)
     command: CommandSectionConfig = Field(default_factory=CommandSectionConfig)
+    auto_off: AutoOffSectionConfig = Field(default_factory=AutoOffSectionConfig)
     permission: PermissionSectionConfig = Field(default_factory=PermissionSectionConfig)
     reply: ReplySectionConfig = Field(default_factory=ReplySectionConfig)
     at_detection: AtDetectionSectionConfig = Field(default_factory=AtDetectionSectionConfig)
@@ -832,6 +860,71 @@ def _source_label(source: str, user_id: str) -> str:
     return source or "未知"
 
 
+def _format_remaining(seconds: float) -> str:
+    """把剩余秒数渲染成中文时长。
+
+    Args:
+        seconds: 剩余秒数。
+
+    Returns:
+        str: 形如「还剩 1 小时 20 分」的文本。
+    """
+
+    total = int(max(0.0, seconds))
+    if total <= 0:
+        return "已到期"
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"还剩 {days} 天 {hours} 小时"
+    if hours:
+        return f"还剩 {hours} 小时 {minutes} 分"
+    return f"还剩 {max(1, minutes)} 分钟"
+
+
+def _parse_timestamp(text: str) -> float:
+    """把「YYYY-mm-dd HH:MM:SS」解析成时间戳。
+
+    Args:
+        text: 时间文本。
+
+    Returns:
+        float: 时间戳；解析失败返回 ``0``。
+    """
+
+    raw = str(text or "").strip()
+    if not raw:
+        return 0.0
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
+def format_expiry(expires_at: float, now: Optional[float] = None) -> str:
+    """渲染自动关闭时间，供 WebUI 与日志使用。
+
+    Args:
+        expires_at: 到期时间戳；``0`` 表示永不关闭。
+        now: 当前时间戳，默认取系统时间。
+
+    Returns:
+        str: 展示文本。
+    """
+
+    if not expires_at:
+        return "永不关闭"
+    try:
+        stamp = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        return "永不关闭"
+    current = time.time() if now is None else now
+    return f"{stamp}（{_format_remaining(expires_at - current)}）"
+
+
 @dataclass
 class WhitelistEntry:
     """一条白名单记录。"""
@@ -842,12 +935,16 @@ class WhitelistEntry:
     added_at: str = ""
     source: str = ""
     user_id: str = ""
+    # 自动关闭时间戳（0 = 永不关闭）
+    expires_at: float = 0.0
+    # /on 时的会话 ID，自动关闭时用它向群里发提示
+    session_id: str = ""
 
-    def to_dict(self) -> Dict[str, str]:
+    def to_dict(self) -> Dict[str, Any]:
         """序列化为可写盘的字典。
 
         Returns:
-            Dict[str, str]: 序列化结果。
+            Dict[str, Any]: 序列化结果。
         """
 
         return {
@@ -857,13 +954,15 @@ class WhitelistEntry:
             "added_at": self.added_at,
             "source": self.source,
             "user_id": self.user_id,
+            "expires_at": float(self.expires_at or 0.0),
+            "session_id": self.session_id,
         }
 
-    def to_public(self) -> Dict[str, str]:
+    def to_public(self) -> Dict[str, Any]:
         """转为 WebUI 表格可直接展示的字典。
 
         Returns:
-            Dict[str, str]: 展示用字典。
+            Dict[str, Any]: 展示用字典。
         """
 
         return {
@@ -873,6 +972,7 @@ class WhitelistEntry:
             "added_at": self.added_at or "—",
             "added_by": _source_label(self.source, self.user_id),
             "added_by_label": _source_label(self.source, self.user_id),
+            "expires_label": format_expiry(self.expires_at),
         }
 
 
@@ -922,6 +1022,10 @@ class WhitelistStore:
             if not _GROUP_ID_RE.match(group_id_text):
                 continue
             record = raw if isinstance(raw, dict) else {}
+            try:
+                expires_at = float(record.get("expires_at") or 0.0)
+            except (TypeError, ValueError):
+                expires_at = 0.0
             loaded[group_id_text] = WhitelistEntry(
                 group_id=group_id_text,
                 group_name=_trim_text(record.get("group_name"), 64),
@@ -929,6 +1033,8 @@ class WhitelistStore:
                 added_at=_trim_text(record.get("added_at"), 32),
                 source=_trim_text(record.get("source"), 16),
                 user_id=_trim_text(record.get("user_id"), 32),
+                expires_at=expires_at,
+                session_id=_trim_text(record.get("session_id"), 128),
             )
         self._groups = loaded
 
@@ -963,6 +1069,8 @@ class WhitelistStore:
         note: str = "",
         source: str = "",
         user_id: str = "",
+        expires_at: float = 0.0,
+        session_id: str = "",
     ) -> bool:
         """把群加入白名单；已存在时只补充群名等展示信息。
 
@@ -972,6 +1080,8 @@ class WhitelistStore:
             note: 备注。
             source: 来源（``command`` / ``webui``）。
             user_id: 操作者 QQ 号。
+            expires_at: 自动关闭时间戳；``0`` 表示永不关闭。
+            session_id: 加入时所在会话 ID，自动关闭时用它发提示。
 
         Returns:
             bool: 本次是否为新增。
@@ -983,6 +1093,10 @@ class WhitelistStore:
                 existing.group_name = _trim_text(group_name, 64)
             if note:
                 existing.note = _trim_text(note, 128)
+            if expires_at:
+                existing.expires_at = float(expires_at)
+            if session_id:
+                existing.session_id = _trim_text(session_id, 128)
             return False
         self._groups[group_id] = WhitelistEntry(
             group_id=group_id,
@@ -991,8 +1105,32 @@ class WhitelistStore:
             added_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             source=_trim_text(source, 16),
             user_id=_trim_text(user_id, 32),
+            expires_at=float(expires_at or 0.0),
+            session_id=_trim_text(session_id, 128),
         )
         return True
+
+    def entries(self) -> List[WhitelistEntry]:
+        """返回全部白名单记录（副本列表，元素为可变对象）。
+
+        Returns:
+            List[WhitelistEntry]: 记录列表。
+        """
+
+        return list(self._groups.values())
+
+    def expired_entries(self, now: Optional[float] = None) -> List[WhitelistEntry]:
+        """返回已经到自动关闭时间、需要移出白名单的记录。
+
+        Args:
+            now: 当前时间戳，默认取系统时间。
+
+        Returns:
+            List[WhitelistEntry]: 已到期的记录。
+        """
+
+        current = time.time() if now is None else now
+        return [entry for entry in self._groups.values() if entry.expires_at and entry.expires_at <= current]
 
     def remove(self, group_id: str) -> bool:
         """把群移出白名单。
@@ -1355,6 +1493,8 @@ class AtGatePlugin(MaiBotPlugin):
         self._force_tasks: Dict[str, asyncio.Task] = {}
         # 会话 ID -> 最近一次成功发出消息的时间戳，用于判断「是否已经回过」
         self._last_outbound_at: Dict[str, float] = {}
+        # 自动关闭检查任务
+        self._auto_off_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -1391,9 +1531,14 @@ class AtGatePlugin(MaiBotPlugin):
 
         self._loaded = True
         self._flush_task = asyncio.create_task(self._flush_loop(), name="atgate-context-flush")
+        # 启动时先静默清掉已经过期的白名单（宿主会话可能还没建好，发不出提示）
+        pruned_groups = await self._prune_expired_entries(notify=False)
+        if pruned_groups:
+            self._get_logger().info("启动时自动关闭了 %d 个已到期的白名单群", pruned_groups)
+        self._auto_off_task = asyncio.create_task(self._auto_off_loop(), name="atgate-auto-off")
         self._get_logger().info(
             "苏醒吧麦麦！已加载：白名单 %d 个群，缓存 %d 个会话 / %d 条消息，注入上限 %d 条；"
-            "命令权限=%s，强制回复=%s，超时兜底=%s（%d 秒）",
+            "命令权限=%s，强制回复=%s，超时兜底=%s（%d 秒），自动关闭=%s",
             len(self._whitelist),
             self._buffer.session_count(),
             self._buffer.message_count(),
@@ -1402,6 +1547,7 @@ class AtGatePlugin(MaiBotPlugin):
             "开" if config.reply.force else "关",
             "开" if (config.reply.force and config.reply.fallback_enabled) else "关",
             int(config.reply.fallback_seconds),
+            f"{config.auto_off.hours:g} 小时" if config.auto_off.hours > 0 else "永不",
         )
 
     async def on_unload(self) -> None:
@@ -1412,6 +1558,11 @@ class AtGatePlugin(MaiBotPlugin):
             task.cancel()
         self._force_tasks.clear()
         self._force_tokens.clear()
+        if self._auto_off_task is not None:
+            self._auto_off_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._auto_off_task
+            self._auto_off_task = None
         if self._flush_task is not None:
             self._flush_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1439,12 +1590,114 @@ class AtGatePlugin(MaiBotPlugin):
             return
         config = self.config
         self._buffer.configure(limit=config.context.size, max_sessions=config.context.max_sessions)
+        rearmed = await self._rearm_auto_off()
         self._get_logger().info(
-            "配置已更新：enabled=%s，注入 %d 条，缓存 %d 个会话",
+            "配置已更新：enabled=%s，注入 %d 条，缓存 %d 个会话，自动关闭=%s（重算 %d 个群）",
             config.plugin.enabled,
             config.context.size,
             self._buffer.session_count(),
+            f"{config.auto_off.hours:g} 小时" if config.auto_off.hours > 0 else "永不",
+            rearmed,
         )
+
+    # ------------------------------------------------------------------
+    # 自动关闭：/on 之后到点自动 /off
+    # ------------------------------------------------------------------
+
+    async def _auto_off_loop(self) -> None:
+        """后台定时检查白名单是否到期。"""
+
+        try:
+            while self._loaded:
+                await asyncio.sleep(AUTO_OFF_CHECK_INTERVAL_SECONDS)
+                if not self._loaded:
+                    return
+                try:
+                    await self._prune_expired_entries(notify=True)
+                except Exception as exc:  # noqa: BLE001 - 单次失败不影响后续检查
+                    self._get_logger().warning("自动关闭检查失败: %s", exc)
+        except asyncio.CancelledError:
+            return
+
+    async def _prune_expired_entries(self, *, notify: bool) -> int:
+        """移除已到期的白名单群，可选地向群里发送关闭提示。
+
+        Args:
+            notify: 是否发送关闭提示。
+
+        Returns:
+            int: 本次移除的群数量。
+        """
+
+        if self._whitelist is None:
+            return 0
+        expired = self._whitelist.expired_entries()
+        if not expired:
+            return 0
+        async with self._mutation_lock:
+            for entry in expired:
+                self._whitelist.remove(entry.group_id)
+            await self._save_whitelist_locked()
+        for entry in expired:
+            self._get_logger().info(
+                "群 %s 的自动回复已到期，已自动移出白名单（到期时间 %s）",
+                entry.group_id,
+                format_expiry(entry.expires_at),
+            )
+            if notify:
+                await self._notify_auto_closed(entry)
+        return len(expired)
+
+    async def _notify_auto_closed(self, entry: WhitelistEntry) -> None:
+        """向自动关闭的群发送提示消息。
+
+        Args:
+            entry: 被移出白名单的记录。
+        """
+
+        text = str(self.config.auto_off.reply_auto_closed or "").strip()
+        if not text:
+            return
+        session_id = entry.session_id.strip()
+        if not session_id:
+            self._get_logger().warning("群 %s 自动关闭，但没有记录会话 ID，跳过关闭提示", entry.group_id)
+            return
+        try:
+            sent = await asyncio.wait_for(self.ctx.send.text(text, session_id), timeout=10.0)
+        except Exception as exc:  # noqa: BLE001 - 提示发不出去不影响关闭
+            self._get_logger().warning("群 %s 自动关闭提示发送失败: %s", entry.group_id, exc)
+            return
+        if sent is False:
+            self._get_logger().warning("群 %s 自动关闭提示发送失败（宿主返回 False）", entry.group_id)
+
+    async def _rearm_auto_off(self) -> int:
+        """配置变化后按当前时长重算命令来源群的到期时间。
+
+        Returns:
+            int: 被重算的记录数量。
+        """
+
+        if self._whitelist is None:
+            return 0
+        hours = float(self.config.auto_off.hours or 0.0)
+        now = time.time()
+        changed = 0
+        for entry in self._whitelist.entries():
+            if entry.source not in ("command", ""):
+                continue
+            if hours <= 0:
+                if entry.expires_at:
+                    entry.expires_at = 0.0
+                    changed += 1
+                continue
+            # 以当初 /on 的时间为基准，避免每次改配置都重置成"从现在开始"
+            base = _parse_timestamp(entry.added_at) or now
+            entry.expires_at = base + hours * 3600.0
+            changed += 1
+        if changed:
+            async with self._mutation_lock:
+                await self._save_whitelist_locked()
+        return changed
 
     # ------------------------------------------------------------------
     # 入站 Hook
@@ -1613,6 +1866,12 @@ class AtGatePlugin(MaiBotPlugin):
             "permission_hint": permission_hint,
             "force_reply": bool(config.reply.force),
             "force_fallback": bool(config.reply.force and config.reply.fallback_enabled),
+            "auto_off_hours": float(config.auto_off.hours or 0.0),
+            "auto_off_label": (
+                f"{config.auto_off.hours:g} 小时后自动关闭"
+                if config.auto_off.hours > 0
+                else "永不自动关闭"
+            ),
             "enabled": config.plugin.enabled,
         }
 
@@ -2042,6 +2301,9 @@ class AtGatePlugin(MaiBotPlugin):
             return
 
         group_name = group_name_of(message)
+        hours = float(config.auto_off.hours or 0.0)
+        expires_at = (time.time() + hours * 3600.0) if hours > 0 else 0.0
+        session_id = str(message.get("session_id") or "").strip()
         if action == "on":
             async with self._mutation_lock:
                 added = self._whitelist.add(
@@ -2049,14 +2311,17 @@ class AtGatePlugin(MaiBotPlugin):
                     group_name=group_name,
                     source="command",
                     user_id=user_id,
+                    expires_at=expires_at,
+                    session_id=session_id,
                 )
                 await self._save_whitelist_locked()
             reply = config.command.reply_added if added else config.command.reply_already
             self._get_logger().info(
-                "群 %s %s白名单（命令，操作者 %s）",
+                "群 %s %s白名单（命令，操作者 %s），自动关闭=%s",
                 group_id,
                 "加入" if added else "已在",
                 user_id or "未知",
+                format_expiry(expires_at),
             )
         else:
             async with self._mutation_lock:

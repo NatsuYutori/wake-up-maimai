@@ -515,6 +515,37 @@ class TestWhitelistStore(unittest.TestCase):
         self.assertEqual(snapshot[0]["group_name"], "测试群")
         self.assertIn(USER_ID, snapshot[0]["added_by_label"])
 
+    def test_expiry_roundtrip_and_query(self) -> None:
+        """自动关闭时间与会话 ID 能落盘读回，并能查出已到期记录。"""
+
+        future = time.time() + 3600
+        self.store.add(
+            GROUP_ID,
+            group_name="测试群",
+            source="command",
+            user_id=USER_ID,
+            expires_at=future,
+            session_id=SESSION_ID,
+        )
+        self.assertEqual(self.store.expired_entries(), [])
+        self.store.save()
+
+        reloaded = atgate.WhitelistStore(self.path)
+        reloaded.load()
+        entry = reloaded.entries()[0]
+        self.assertAlmostEqual(entry.expires_at, future, delta=1)
+        self.assertEqual(entry.session_id, SESSION_ID)
+        self.assertIn("还剩", reloaded.snapshot()[0]["expires_label"])
+        self.assertEqual(reloaded.expired_entries(now=future + 1)[0].group_id, GROUP_ID)
+
+    def test_never_expiring_entry_has_label(self) -> None:
+        """未设置自动关闭时展示「永不关闭」。"""
+
+        self.store.add(GROUP_ID, source="command")
+        self.assertEqual(self.store.entries()[0].expires_at, 0.0)
+        self.assertEqual(self.store.snapshot()[0]["expires_label"], "永不关闭")
+        self.assertEqual(self.store.expired_entries(), [])
+
     def test_corrupted_file_is_quarantined(self) -> None:
         """损坏文件被备份，插件以空状态启动。"""
 
@@ -1182,6 +1213,140 @@ class TestForceReply(PluginTestCase):
             await plugin._force_watchdog(SESSION_ID, make_message(), "上下文块", token, time.time())
             self.assertEqual(len(self.ctx.maisaka.reply.calls), 1)
             self.assertEqual(self.ctx.send.sent, [])
+
+        self.run_loaded(scenario)
+
+
+class TestAutoOff(PluginTestCase):
+    """自动关闭：到点自动 /off 并发送提示。"""
+
+    def test_on_sets_expiry_when_enabled(self) -> None:
+        """/on 后按配置写入自动关闭时间与会话 ID。"""
+
+        config = self.plugin.get_default_config()
+        config["auto_off"]["hours"] = 2
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("/on", is_at=True, at=[BOT_QQ]))
+            entry = plugin._whitelist.entries()[0]
+            self.assertAlmostEqual(entry.expires_at, time.time() + 7200, delta=15)
+            self.assertEqual(entry.session_id, SESSION_ID)
+            self.assertIn("白名单", self.ctx.send.sent[0]["text"])
+
+        self.run_loaded(scenario)
+
+    def test_on_without_auto_off_never_expires(self) -> None:
+        """默认永不自动关闭。"""
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("/on", is_at=True, at=[BOT_QQ]))
+            self.assertEqual(plugin._whitelist.entries()[0].expires_at, 0.0)
+
+        self.run_loaded(scenario)
+
+    def test_toggle_messages_are_configurable(self) -> None:
+        """/on、/off 的回执文案可以自定义。"""
+
+        config = self.plugin.get_default_config()
+        config["command"]["reply_added"] = "开啦，之后会正常接话"
+        config["command"]["reply_removed"] = "关啦，只回 @ 了"
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("/on", is_at=True, at=[BOT_QQ]))
+            await plugin.handle_incoming_message(message=make_message("/off", is_at=True, at=[BOT_QQ]))
+            self.assertEqual([item["text"] for item in self.ctx.send.sent], ["开啦，之后会正常接话", "关啦，只回 @ 了"])
+
+        self.run_loaded(scenario)
+
+    def test_expired_group_is_removed_and_notified(self) -> None:
+        """到期的群被移出白名单，并向该群发送「自动回复已关闭」提示。"""
+
+        config = self.plugin.get_default_config()
+        config["auto_off"]["hours"] = 1
+        config["auto_off"]["reply_auto_closed"] = "自动回复已关闭，之后只回 @ 啦"
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("/on", is_at=True, at=[BOT_QQ]))
+            self.ctx.send.sent.clear()
+            plugin._whitelist.entries()[0].expires_at = time.time() - 1
+            removed = await plugin._prune_expired_entries(notify=True)
+            self.assertEqual(removed, 1)
+            self.assertFalse(plugin._whitelist.contains(GROUP_ID))
+            self.assertEqual(self.ctx.send.sent[0]["text"], "自动回复已关闭，之后只回 @ 啦")
+            self.assertEqual(self.ctx.send.sent[0]["stream_id"], SESSION_ID)
+
+        self.run_loaded(scenario)
+
+    def test_expired_entry_without_session_skips_notice(self) -> None:
+        """没有记录会话 ID 时只关闭，不发提示。"""
+
+        config = self.plugin.get_default_config()
+        config["auto_off"]["hours"] = 1
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            plugin._whitelist.add(GROUP_ID, source="command", expires_at=time.time() - 1)
+            removed = await plugin._prune_expired_entries(notify=True)
+            self.assertEqual(removed, 1)
+            self.assertFalse(plugin._whitelist.contains(GROUP_ID))
+            self.assertEqual(self.ctx.send.sent, [])
+
+        self.run_loaded(scenario)
+
+    def test_rearm_updates_expiry_after_config_change(self) -> None:
+        """改小时数后，已 /on 的群按原始加入时间重算到期点。"""
+
+        config = self.plugin.get_default_config()
+        config["auto_off"]["hours"] = 3
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("/on", is_at=True, at=[BOT_QQ]))
+            entry = plugin._whitelist.entries()[0]
+            added_ts = atgate._parse_timestamp(entry.added_at)
+            self.assertGreater(added_ts, 0)
+
+            new_config = plugin.get_default_config()
+            new_config["auto_off"]["hours"] = 1
+            plugin.set_plugin_config(new_config)
+            self.assertEqual(await plugin._rearm_auto_off(), 1)
+            self.assertAlmostEqual(plugin._whitelist.entries()[0].expires_at, added_ts + 3600, delta=2)
+
+            disabled = plugin.get_default_config()
+            disabled["auto_off"]["hours"] = 0
+            plugin.set_plugin_config(disabled)
+            await plugin._rearm_auto_off()
+            self.assertEqual(plugin._whitelist.entries()[0].expires_at, 0.0)
+
+        self.run_loaded(scenario)
+
+    def test_webui_added_group_never_expires(self) -> None:
+        """WebUI 手动添加的群不参与自动关闭。"""
+
+        config = self.plugin.get_default_config()
+        config["auto_off"]["hours"] = 1
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.webui_add_group(group_id=GROUP_ID, group_name="测试群")
+            self.assertEqual(plugin._whitelist.entries()[0].expires_at, 0.0)
+
+        self.run_loaded(scenario)
+
+    def test_snapshot_reports_auto_off(self) -> None:
+        """页面快照带上自动关闭时长文案。"""
+
+        config = self.plugin.get_default_config()
+        config["auto_off"]["hours"] = 6
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            snapshot = await plugin.webui_whitelist_snapshot()
+            self.assertEqual(snapshot["auto_off_hours"], 6.0)
+            self.assertIn("6 小时", snapshot["auto_off_label"])
 
         self.run_loaded(scenario)
 

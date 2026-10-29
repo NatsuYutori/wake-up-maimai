@@ -13,6 +13,9 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 
 群内 `@麦麦 /on` 把本群加入白名单，`@麦麦 /off` 移出；WebUI 插件页可做同样的事，两边共享同一份持久化数据。
 
+- `/on` 的回执、`/off` 的回执、以及**自动关闭**的提示，三段文案都能在配置里逐条改写（见 [群内命令](#群内命令)）。
+- 可选的**自动关闭**：给 `/on` 加一个倒计时，到点自动移出白名单并往群里发一条提示；默认不关闭（见 [自动关闭](#自动关闭on-之后到点自动-off)）。
+
 ## ⚠️ 装好后请先确认这几个默认值
 
 | 配置项 | 默认 | 为什么要看一眼 |
@@ -51,6 +54,7 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 
 - 必须 **@ 机器人** 才生效；不带 @ 的 `/on` 只是普通聊天内容。
 - 命令词可在配置里改（`command.on_words` / `off_words`），支持多别名。
+- **三段回执文案都可自定义**：`command.reply_added`（`/on` 成功）、`command.reply_removed`（手动 `/off` 成功）、`auto_off.reply_auto_closed`（到点自动关闭时发的提示）。另外 `reply_already` / `reply_not_in` / `reply_denied` 分别对应"重复 /on""不在白名单却 /off""没权限"，也都能改。
 - 命令消息本身会被拦截，不会进入 Maisaka，所以麦麦不会「回答」你的命令；插件会回一条确认（可关）。
 - 权限：默认 `all`，任何群成员都能切换；想收紧就把 `permission.mode` 切成 `admin`，在 `permission.admins` 里填 QQ 号（一个一行，写成 `123456` 或 `123456:昵称` 都行）。`admin` 但名单为空时会拒绝所有人并打 WARNING（防止误配成全员可操作）。旧版本的 `permission.users` 字段会自动迁移成 `admins`。
 
@@ -66,14 +70,24 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 - 兜底是"没检测到任何出站消息"才触发，所以正常情况下不会多说话；但如果你把 `fallback_seconds` 调得很短，而麦麦恰好在那之后才回复，群里会出现两条。默认 45 秒足够覆盖正常的思考 + 打字延迟。
 - `reply.force = false` 会同时关掉这两层，回到"只放行、不保证回复"。
 
+## 自动关闭（/on 之后到点自动 /off）
+
+在插件配置「自动关闭」里把 `auto_off.hours` 设成大于 0 的小时数（默认 `0` = **永不关闭**），之后通过 `@麦麦 /on` 加入白名单的群就会带上倒计时：
+
+- 到点（每 30 秒检查一次）自动移出白名单，该群恢复「只回复 @」，并往群里发 `auto_off.reply_auto_closed`（默认是一句「自动回复时间到啦…」，可自定义，留空则不发）。
+- 重复 `/on` 会把倒计时**重置**为从现在起算；WebUI 里手动添加的群**不会**自动关闭，需要手动移出（页面会显示「自动关闭」列，永久群显示"永不关闭"）。
+- 改配置里的小时数会立即重算：以当初 `/on` 的时间为基准；把小时数改回 `0` 会清掉所有到期点，恢复"永不关闭"。
+- 插件重启后到期点仍在（写在 `whitelist.json` 里）；启动瞬间已经过期的群会被静默清理（此时宿主会话可能还没建好，不保证能发出提示）。
+
 ## WebUI 页面
 
 页面提供：
 
 - **统计**：白名单群数、已缓存会话数、已缓存消息数、当前命令权限模式
 - **权限提示**：一行文字说明当前是 `all` 还是 `admin`（含管理员人数），切模式后立刻反映
+- **自动关闭提示**：一行文字说明当前是"永不自动关闭"还是"N 小时后自动关闭"
 - **添加**：填群号（必填）、群名（可选）、备注（可选）→ 加入白名单
-- **表格**：点击某行打开详情，可在详情里「移出白名单」（二次确认）
+- **表格**：点击某行打开详情，可在详情里「移出白名单」（二次确认）；表格含「自动关闭」列（到期时间 + 剩余时长 / 永不关闭）
 - **清空白名单**、**清空上下文缓存**（均有二次确认）
 
 页面上的增删与群内 `/on`、`/off` 操作同一份数据，改完立即对入站消息生效，无需重载插件。
@@ -96,9 +110,11 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 | `command.on_words` | `["/on"]` | 加入白名单的命令词 |
 | `command.off_words` | `["/off"]` | 移出白名单的命令词 |
 | `command.reply_on_toggle` | `true` | 执行命令后是否群里回执 |
-| `command.reply_added` / `reply_removed` / `reply_already` / `reply_not_in` / `reply_denied` | 内置文案 | 五种回执文本 |
+| `command.reply_added` / `reply_removed` / `reply_already` / `reply_not_in` / `reply_denied` | 内置文案 | 五种回执文本，其中 `reply_added` 是 `/on` 成功、`reply_removed` 是手动 `/off` 成功时发的内容 |
 | `permission.mode` | `all` | `all`=任何群成员都能切换白名单；`admin`=仅 `permission.admins` 内的 QQ 号可以 |
 | `permission.admins` | `[]` | `mode=admin` 时的管理员 QQ 号列表（支持 `123456`、`123456:昵称` 两种写法） |
+| `auto_off.hours` | `0` | `/on` 之后多少小时自动移出白名单并停止自动回复；`0`=永不自动关闭（0–8760，支持小数） |
+| `auto_off.reply_auto_closed` | 内置文案 | 自动关闭时发到群里的提示，留空则不发 |
 | `reply.force` | `true` | 被 @ 时是否在注入内容末尾追加强制回复指令 |
 | `reply.force_note` | 内置文案 | 追加的强制回复指令正文，可改成你喜欢的话术，留空则不加 |
 | `reply.fallback_enabled` | `true` | 是否启用超时兜底补发 |
@@ -112,7 +128,7 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 
 | 文件 | 内容 |
 |---|---|
-| `whitelist.json` | 白名单：群号、群名、备注、加入时间、来源（命令 / WebUI）、操作者 |
+| `whitelist.json` | 白名单：群号、群名、备注、加入时间、来源（命令 / WebUI）、操作者、**自动关闭时间**、加入时的会话 ID（只用于到期提示） |
 | `context_cache.json` | 每个群最近 N 条消息的**文本**，非文本消息记为 `[图片]`、`[表情]` 等占位符 |
 
 - 只保存文本与占位符，不保存图片 / 语音 / 文件的二进制内容。
@@ -128,6 +144,7 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 - **首次 @ 的会话**：群里第一条消息就是 @ 时，宿主还没有该群会话；插件先 `chat.open_session` 建流（群会话 ID 只由 platform/account_id/scope/group_id 决定，与发送者无关），再 `maisaka.context.append` 注入并重试。
 - **注入失败不阻断**：注入超时 / 被策略拒绝时只打 WARNING，@ 消息照常放行，退化为「无上下文的正常回复」。
 - **强制回复的两层**：提示词层只是往 `maisaka.context.append` 的文本块末尾追加指令（零风险）；兜底层用 `send_service.after_send`（观察模式 Hook）判断该会话在等待窗口内是否真的发出了消息——发出就清令牌取消兜底，没发出才调 `maisaka.reply.generate` + `send.text` 补一条。
+- **自动关闭**：到期时间写在白名单记录里（`expires_at` + 加入时的 `session_id`），后台每 30 秒扫一次，到点移除并发提示；启动时静默清理已过期记录。只有 `/on` 命令来源的记录会带到期时间，WebUI 手动添加的视为长期有效。
 - **单文件实现**：插件加载器按文件路径导入 `plugin.py`，不会把插件目录加入 `sys.path`，所以逻辑全部放在单文件内，测试通过 `importlib` 从路径加载。
 
 ## 验收清单
@@ -148,6 +165,9 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 12. 把 `permission.mode` 切成 `admin`、`permission.admins` 只填自己：自己 `@麦麦 /off` 生效，换个小号再试会被拒绝并收到「没有权限」回执（页面顶部提示同步变成 admin 文案）。
 13. 兜底验证：临时把 `reply.fallback_seconds` 调到 `10`、并在 MaiBot 里让该群回复频率为 0（或直接不回复），`@麦麦 在吗` 后约 10 秒，日志出现「已由插件调用 Replyer 补发一条回复」，群里收到一条回复。
 14. 把 `context.prefix` 改成 `【本群最近 {count} 条】` 后 `@麦麦`，在 Maisaka 上下文里能看到自定义前缀；`reply.force_note` 改动同样生效。
+15. 自动关闭：`auto_off.hours` 设成 `0.05`（3 分钟）→ `@麦麦 /on`（页面「自动关闭」列显示还剩几分钟）→ 等 3 分钟（检查间隔 30 秒，最多 3.5 分钟）→ 群里收到 `auto_off.reply_auto_closed` 那条提示，之后普通消息不再被回复，页面该群消失。
+16. 三段文案自定义：把 `command.reply_added`、`command.reply_removed`、`auto_off.reply_auto_closed` 都改成好认的句子，分别走一遍 `/on`、`/off`、自动到期，确认群里收到的是自己改的文案。
+17. `auto_off.hours` 从 `3` 改成 `1` 并保存配置：日志出现「重算 N 个群」，页面「自动关闭」列的剩余时间随之变短；改回 `0` 后该列全部变回「永不关闭」。
 
 ## 排障
 
@@ -168,7 +188,7 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 # 依赖：插件 SDK（含 pydantic）
 pip install maibot-plugin-sdk
 
-# 单元测试（84 个用例，全部使用假宿主，不连接 MaiBot）
+# 单元测试（94 个用例，全部使用假宿主，不连接 MaiBot）
 python -m unittest discover -s tests -v
 
 # 静态检查
@@ -177,7 +197,7 @@ python -m json.tool _manifest.json > /dev/null
 python -m json.tool webui.json > /dev/null
 ```
 
-测试覆盖：@ 判定（`is_at` 标志 / @ 段与 `account_id` 比对 / 账号缺失）、命令解析（含 `@名片` 前缀、`/once` 不误命中）、环形缓存（截断 / LRU / 落盘往返 / 损坏恢复 / TTL 淘汰）、白名单（幂等 / 持久化 / 非法群号）、决策分支（私聊 / 通知 / 白名单 / 丢弃 / 注入）、注入失败降级、强制回复（指令注入 / 兜底触发 / 已回复则取消 / 生成失败不外发）、权限模式（all / admin / 旧 `users` 字段迁移）、WebUI API 增删查清。
+测试覆盖：@ 判定（`is_at` 标志 / @ 段与 `account_id` 比对 / 账号缺失）、命令解析（含 `@名片` 前缀、`/once` 不误命中）、环形缓存（截断 / LRU / 落盘往返 / 损坏恢复 / TTL 淘汰）、白名单（幂等 / 持久化 / 非法群号 / 到期查询）、自动关闭（到期移除并提示 / 无会话 ID 跳过提示 / 配置变更重算 / WebUI 添加不过期）、决策分支（私聊 / 通知 / 白名单 / 丢弃 / 注入）、注入失败降级、强制回复（指令注入 / 兜底触发 / 已回复则取消 / 生成失败不外发）、权限模式（all / admin / 旧 `users` 字段迁移）、WebUI API 增删查清。
 
 ## 已知限制
 
@@ -187,8 +207,14 @@ python -m json.tool webui.json > /dev/null
 - 被丢弃的消息不会进入 MaiBot 的任何历史、记忆、学习与统计。
 - 缓存内容只有文本与占位符，20 条窗口是插件自己的缓存，不等同于宿主完整聊天记录。
 - 兜底回复由 `maisaka.reply.generate`（Replyer 长文生成链路）产出，**不经过 Planner**，因此不会调用工具、也不会走正常 Agent 记忆检索；它只是保证"有回应"的保险，正常回复仍以 Planner 为主。
+- 自动关闭按 30 秒粒度检查，所以实际关闭时间可能比设定值晚最多 30 秒；重启瞬间已过期的群会被静默清理（不保证发出关闭提示）。
 
 ## 更新日志
+
+### 1.3.0
+- 新增「自动关闭」：`auto_off.hours`（默认 `0` = 永不关闭）设成大于 0 后，`@麦麦 /on` 加入的群到点自动移出白名单并停止自动回复，同时向该群发送 `auto_off.reply_auto_closed`。支持配置热更新重算、重启后保留到期点；WebUI 手动添加的群不参与自动关闭。
+- 三段回执文案全部可自定义：`command.reply_added`（`/on`）、`command.reply_removed`（手动 `/off`）、`auto_off.reply_auto_closed`（自动关闭）。
+- WebUI 白名单表格新增「自动关闭」列（到期时间 + 剩余时长 / 永不关闭），详情弹窗同步展示，页面顶部显示当前自动关闭策略。
 
 ### 1.2.0
 - 新增 `permission.mode` 的 `all` / `admin` 两种模式与 `permission.admins` 管理员名单：默认 `all`（任何群成员可切换白名单），切成 `admin` 后只有名单内 QQ 号能执行 `@麦麦 /on`、`/off`；旧版 `users` 字段自动迁移。
