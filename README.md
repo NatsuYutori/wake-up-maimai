@@ -13,6 +13,13 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 
 群内 `@麦麦 /on` 把本群加入白名单，`@麦麦 /off` 移出；WebUI 插件页可做同样的事，两边共享同一份持久化数据。
 
+## ⚠️ 装好后请先确认这两个默认值
+
+| 配置项 | 默认 | 为什么要看一眼 |
+|---|---|---|
+| `at_detection.unresolved` | `drop` | 适配器**不上报 `account_id`** 时，插件认不出「哪条 @ 是我」，会把该群的非 @ 消息当普通消息丢弃，外在表现就是「**麦麦突然不理人**」。此时日志会打 **ERROR「【需要处理】群 xxx 无法确认机器人账号」**，WebUI 页面顶部也会出现红色提示条。修法见 [排障](#排障)。 |
+| `permission.mode` | `anyone` | 默认**任何群成员**都能 `@麦麦 /on` 把整个群加进白名单、让麦麦开始全天候接话。只想让少数人改动白名单时，改成 `list` 并填 `permission.users`。 |
+
 ## 环境要求
 
 - MaiBot `1.3.x`（manifest 声明 `1.3.0`–`1.3.99`；若你用的是 1.4+，把 `_manifest.json` 里的 `host_application.max_version` 调到 `1.4.99` 即可）
@@ -69,6 +76,7 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 | `context.message_max_chars` | `300` | 注入文本里单条消息的截断长度 |
 | `context.max_total_chars` | `4000` | 整块注入文本上限，超出时从最旧的消息开始省略 |
 | `context.max_sessions` | `200` | 最多缓存多少个群，超出按最久未活跃淘汰 |
+| `context.cache_ttl_hours` | `72` | **缓存自动淘汰时间**：某群超过这么多小时没有新消息，就把它的聊天缓存整体删除（后台定时执行，启动时也会先清一次）。`0` = 永不自动淘汰 |
 | `context.flush_interval_seconds` | `3.0` | 缓存落盘间隔（内存中的缓存即时可用，不必等落盘） |
 | `command.on_words` | `["/on"]` | 加入白名单的命令词 |
 | `command.off_words` | `["/off"]` | 移出白名单的命令词 |
@@ -88,6 +96,7 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 | `context_cache.json` | 每个群最近 N 条消息的**文本**，非文本消息记为 `[图片]`、`[表情]` 等占位符 |
 
 - 只保存文本与占位符，不保存图片 / 语音 / 文件的二进制内容。
+- **自动过期**：某群超过 `context.cache_ttl_hours`（默认 72 小时）没有新消息，它的缓存会在后台定时任务里被整条删除，磁盘不会无限增长。设为 `0` 可关闭自动过期，此时只能手动清。
 - 两个文件都是原子写（临时文件 + `os.replace`），文件损坏时会备份为 `.bak` 并以空状态启动（日志 WARNING）。
 - 卸载插件不会删除数据；需要清理时用页面「清空白名单」「清空上下文缓存」，或手动删除上述两个文件。
 - 被丢弃的普通消息**不会**进入 MaiBot 的聊天记录、记忆、学习与统计——这是「丢弃」的必然结果，加入白名单后恢复正常。
@@ -114,13 +123,14 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 8. WebUI 里手动添加一个群 → 该群立即放行；再移出 → 立即恢复门禁。
 9. 重启 MaiBot（白名单与缓存都还在，页面数据不变）。
 10. 私聊机器人、群内戳一戳等通知消息不受影响；发图片 / 表情 / 引用消息不报错。
+11. 把 `context.cache_ttl_hours` 临时改成 `0` 之外的小值（如 `1`）并等待后台任务，日志出现「上下文缓存按活跃度淘汰」，页面「缓存会话数」下降（验证自动过期）。
 
 ## 排障
 
 | 现象 | 排查 |
 |---|---|
 | 机器人完全不回复任何消息 | 插件 `enabled` 是否为 true；该群是否在白名单（白名单群不走本插件，但 MaiBot 本身也可能因频率/策略不回复）；看日志有没有「无法确认机器人账号」 |
-| @ 了也不回复 | 日志 WARNING「群 xxx 中无法确认机器人账号」说明 `account_id` 缺失或不一致：核对 `bot_config.toml` 的 `qq_account` 与 SnowLuma 里登录的 QQ；也可临时把 `at_detection.unresolved` 设为 `pass` 验证 |
+| @ 了也不回复 | 日志 **ERROR「【需要处理】群 xxx 无法确认机器人账号」** 说明 `account_id` 缺失或不一致：核对 `bot_config.toml` 的 `qq_account` 与 SnowLuma 里登录的 QQ；WebUI 页面顶部也会出现同一条红色提示，列出受影响的群。也可临时把 `at_detection.unresolved` 设为 `pass` 验证 |
 | 命令没反应 | 是否 @ 了机器人；`command.on_words` 是否被改；`permission.mode=list` 时自己是否在 `permission.users` 里（日志会写「权限不足」） |
 | 被 @ 有回复但没有历史上下文 | 日志有「上下文注入失败」：首次建流失败或适配器策略拒绝；群里先随便聊几条再 @ 试试 |
 | WebUI 加群报「群号应为 5-12 位数字」 | 群号只接受数字，注意不要带空格或 `群` 字样 |
@@ -150,6 +160,16 @@ python -m json.tool webui.json > /dev/null
 - 不校验群管理员身份（只支持 QQ 号名单），避免依赖适配器私有接口。
 - 被丢弃的消息不会进入 MaiBot 的任何历史、记忆、学习与统计。
 - 缓存内容只有文本与占位符，20 条窗口是插件自己的缓存，不等同于宿主完整聊天记录。
+
+## 更新日志
+
+### 1.1.0
+- 新增 `context.cache_ttl_hours`（默认 72 小时）：按活跃度自动淘汰长期没有新消息的群缓存，后台定时执行，启动时也会先清理一次；`context_cache.json` 不再无限增长，设 `0` 可关闭。
+- 「认不出机器人身份」的告警从 WARNING 升级为 **ERROR**，并在 WebUI 页面顶部显示提示条（列出受影响的群与修法），避免出现「麦麦突然不理人」却查不到原因。
+- README 新增「装好后请先确认这两个默认值」，说明 `at_detection.unresolved` 与 `permission.mode` 的影响。
+
+### 1.0.0
+- 首个版本：默认只回复 @、@ 时注入最近 20 条群聊上下文、`/on` `/off` 与 WebUI 白名单管理。
 
 ## License
 

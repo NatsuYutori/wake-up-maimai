@@ -102,6 +102,20 @@
           ]
         },
         {
+          "type": "text",
+          "value": {
+            "source": "snapshot",
+            "field": "unresolved_hint"
+          },
+          "when": {
+            "reference": {
+              "source": "snapshot",
+              "field": "unresolved_hint"
+            },
+            "operator": "not_empty"
+          }
+        },
+        {
           "type": "card",
           "label": "添加群到白名单",
           "children": [
@@ -263,7 +277,7 @@
           "children": [
             {
               "type": "text",
-              "value": "群内 @麦麦 /on、/off 与这里的增删改的是同一份白名单数据，任何一边操作都会立即生效并持久化到插件数据目录。默认所有群不在白名单：非 @ 消息被丢弃，@ 时把该群最近 20 条消息（插件自建缓存，非宿主数据库）注入 Maisaka 上下文。"
+              "value": "群内 @麦麦 /on、/off 与这里的增删改的是同一份白名单数据，任何一边操作都会立即生效并持久化到插件数据目录。默认所有群不在白名单：非 @ 消息被丢弃，@ 时把该群最近 20 条消息（插件自建缓存，非宿主数据库）注入 Maisaka 上下文。缓存按活跃度自动淘汰：某群超过 context.cache_ttl_hours（默认 72 小时）没有新消息，其缓存会被整体删除，可在下方手动立即清空。"
             }
           ]
         }

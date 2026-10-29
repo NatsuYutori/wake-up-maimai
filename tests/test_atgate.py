@@ -15,6 +15,7 @@ import json
 import logging
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -540,6 +541,37 @@ class TestContextBuffer(unittest.TestCase):
         self.assertEqual(buffer.session_count(), 2)
         self.assertEqual(buffer.recent("s2"), [])
 
+    def test_prune_expired_drops_inactive_sessions(self) -> None:
+        """超过 TTL 没有新消息的会话会被整条淘汰，活跃会话保留。"""
+
+        buffer = atgate.ContextBuffer(limit=5, max_sessions=10)
+        buffer.record("old", GROUP_ID, self.make_entry("旧消息", ts=1000.0))
+        buffer.record("fresh", GROUP_ID, self.make_entry("新消息", ts=10_000.0))
+        pruned = buffer.prune_expired(3600.0, now=10_500.0)
+        self.assertEqual(pruned, 1)
+        self.assertEqual(buffer.recent("old"), [])
+        self.assertEqual(len(buffer.recent("fresh")), 1)
+        self.assertTrue(buffer.dirty)
+
+    def test_prune_expired_disabled_when_zero(self) -> None:
+        """ttl 为 0 表示永不自动淘汰。"""
+
+        buffer = atgate.ContextBuffer(limit=5, max_sessions=10)
+        buffer.record(SESSION_ID, GROUP_ID, self.make_entry("很久以前", ts=1.0))
+        self.assertEqual(buffer.prune_expired(0, now=10_000.0), 0)
+        self.assertEqual(len(buffer.recent(SESSION_ID)), 1)
+
+    def test_prune_expired_returns_zero_when_all_fresh(self) -> None:
+        """没有过期会话时不改脏标记。"""
+
+        with tempfile.TemporaryDirectory() as temp:
+            buffer = atgate.ContextBuffer(limit=5, max_sessions=10)
+            buffer.record(SESSION_ID, GROUP_ID, self.make_entry("刚说的", ts=10_000.0))
+            buffer.save(Path(temp) / "cache.json")
+            self.assertFalse(buffer.dirty)
+            self.assertEqual(buffer.prune_expired(3600.0, now=10_100.0), 0)
+            self.assertFalse(buffer.dirty)
+
     def test_configure_shrinks_existing(self) -> None:
         """调小上限会立即裁剪已有缓存。"""
 
@@ -812,11 +844,27 @@ class TestHookBehaviour(PluginTestCase):
         self.run_loaded(scenario)
 
     def test_unresolved_identity_policy(self) -> None:
-        """无法确认机器人账号时按配置决定丢弃或放行。"""
+        """无法确认机器人账号时按配置决定丢弃或放行，并给出醒目告警。"""
 
         async def scenario(plugin: Any) -> None:
             message = make_message("看看这个", account_id="", at=[USER_ID])
-            self.assertEqual(await plugin.handle_incoming_message(message=message), {"action": "abort"})
+            with self.assertLogs("atgate.tests", level="ERROR") as captured:
+                self.assertEqual(await plugin.handle_incoming_message(message=message), {"action": "abort"})
+            self.assertTrue(any("无法确认机器人账号" in line for line in captured.output))
+            snapshot = await plugin.webui_whitelist_snapshot()
+            self.assertEqual(snapshot["unresolved_group_count"], 1)
+            self.assertIn(GROUP_ID, snapshot["unresolved_hint"])
+
+        self.run_loaded(scenario)
+
+    def test_unresolved_hint_is_empty_when_identity_known(self) -> None:
+        """机器人身份可确认时页面上不出现告警文本。"""
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("正常消息"))
+            snapshot = await plugin.webui_whitelist_snapshot()
+            self.assertEqual(snapshot["unresolved_group_count"], 0)
+            self.assertEqual(snapshot["unresolved_hint"], "")
 
         self.run_loaded(scenario)
 
@@ -866,17 +914,20 @@ class TestPersistenceAcrossReload(PluginTestCase):
         self.run_loaded(second)
 
     def test_context_cache_survives_reload(self) -> None:
-        """缓存落盘后重新加载仍可用于注入。"""
+        """缓存落盘后重新加载仍可用于注入（时间戳取当前时间，避免被 TTL 淘汰）。"""
 
-        async def first(plugin: Any) -> None:
-            await plugin.handle_incoming_message(message=make_message("缓存里的话"))
-
-        self.run_loaded(first)
-
-        self.plugin = atgate.AtGatePlugin()
-        self.ctx = FakeContext(self.data_dir)
-        self.plugin._set_context(self.ctx)
-        self.plugin.set_plugin_config(self.plugin.get_default_config())
+        buffer = atgate.ContextBuffer(limit=5, max_sessions=10)
+        buffer.record(
+            SESSION_ID,
+            GROUP_ID,
+            atgate.ContextEntry(
+                nickname="阿岚",
+                user_id=USER_ID,
+                text="缓存里的话",
+                ts=time.time(),
+            ),
+        )
+        buffer.save(self.data_dir / atgate.CONTEXT_CACHE_FILENAME)
 
         async def second(plugin: Any) -> None:
             await plugin.handle_incoming_message(message=make_message("在吗", is_at=True, at=[BOT_QQ]))
@@ -884,6 +935,29 @@ class TestPersistenceAcrossReload(PluginTestCase):
             self.assertIn("缓存里的话", content)
 
         self.run_loaded(second)
+
+    def test_stale_cache_is_pruned_on_load(self) -> None:
+        """加载时按 TTL 清掉很久没有新消息的会话，避免聊天文本长期留盘。"""
+
+        buffer = atgate.ContextBuffer(limit=5, max_sessions=10)
+        buffer.record(
+            SESSION_ID,
+            GROUP_ID,
+            atgate.ContextEntry(
+                nickname="阿岚",
+                user_id=USER_ID,
+                text="陈年旧事",
+                ts=time.time() - 30 * 86400,
+            ),
+        )
+        buffer.save(self.data_dir / atgate.CONTEXT_CACHE_FILENAME)
+
+        async def scenario(plugin: Any) -> None:
+            snapshot = await plugin.webui_whitelist_snapshot()
+            self.assertEqual(snapshot["cache_session_count"], 0)
+            self.assertEqual(snapshot["cache_message_count"], 0)
+
+        self.run_loaded(scenario)
 
 
 class TestWebUiApi(PluginTestCase):
@@ -966,6 +1040,7 @@ class TestWebUiApi(PluginTestCase):
             snapshot = await plugin.webui_whitelist_snapshot()
             self.assertEqual(snapshot["mode"], "drop_non_at")
             self.assertEqual(snapshot["context_size"], 20)
+            self.assertEqual(snapshot["cache_ttl_hours"], 72)
             self.assertEqual(snapshot["permission_mode"], "anyone")
 
         self.run_loaded(scenario)

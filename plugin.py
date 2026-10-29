@@ -498,6 +498,16 @@ class ContextSectionConfig(PluginConfigBase):
         le=2000,
         description="最多缓存多少个会话，超出后按最近活跃时间淘汰最久未使用的群。",
     )
+    cache_ttl_hours: int = Field(
+        default=72,
+        ge=0,
+        le=8760,
+        description=(
+            "缓存自动淘汰时间（小时）：某个群超过这么久没有新消息，就把它的聊天缓存从内存和 "
+            "context_cache.json 中整体删除（后台定时执行，重启时也会先清一次）。"
+            "设为 0 表示永不过期，只能手动清空。"
+        ),
+    )
     flush_interval_seconds: float = Field(
         default=3.0,
         ge=0.5,
@@ -1038,6 +1048,37 @@ class ContextBuffer:
             self._group_ids.pop(stale_id, None)
             self._updated_at.pop(stale_id, None)
 
+    def prune_expired(self, ttl_seconds: float, now: Optional[float] = None) -> int:
+        """按活跃度淘汰过期会话。
+
+        某个会话最后一条消息的时间早于 ``now - ttl_seconds`` 时，整条会话（含消息、群号、
+        更新时间记录）一并删除，避免聊天文本长期滞留在磁盘上。
+
+        Args:
+            ttl_seconds: 保留时长（秒）；小于等于 0 表示不淘汰。
+            now: 当前时间戳（秒），默认取系统时间。
+
+        Returns:
+            int: 被淘汰的会话数量。
+        """
+
+        if ttl_seconds <= 0:
+            return 0
+        current = time.time() if now is None else float(now)
+        cutoff = current - ttl_seconds
+        expired = [
+            session_id
+            for session_id, entries in self._sessions.items()
+            if not entries or entries[-1].ts < cutoff
+        ]
+        for session_id in expired:
+            self._sessions.pop(session_id, None)
+            self._group_ids.pop(session_id, None)
+            self._updated_at.pop(session_id, None)
+        if expired:
+            self.dirty = True
+        return len(expired)
+
     def recent(self, session_id: str, limit: Optional[int] = None) -> List[ContextEntry]:
         """读取会话最近的消息。
 
@@ -1182,7 +1223,8 @@ class AtGatePlugin(MaiBotPlugin):
         self._data_dir: Optional[Path] = None
         self._flush_task: Optional[asyncio.Task] = None
         self._mutation_lock = asyncio.Lock()
-        self._warned_groups: Set[str] = set()
+        # 群号 -> 首次发现身份无法确认的时间，用于 WebUI 展示与去重告警
+        self._unresolved_groups: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -1208,6 +1250,14 @@ class AtGatePlugin(MaiBotPlugin):
         self._buffer.load(data_dir / CONTEXT_CACHE_FILENAME)
         if self._buffer.recovered_from_corruption:
             self._get_logger().warning("上下文缓存文件损坏，已备份为 .bak，本次以空缓存启动")
+        ttl_hours = config.context.cache_ttl_hours
+        pruned = self._buffer.prune_expired(float(ttl_hours) * 3600.0)
+        if pruned:
+            self._get_logger().info(
+                "启动时按活跃度淘汰了 %d 个超过 %d 小时无新消息的缓存会话",
+                pruned,
+                ttl_hours,
+            )
 
         self._loaded = True
         self._flush_task = asyncio.create_task(self._flush_loop(), name="atgate-context-flush")
@@ -1305,11 +1355,17 @@ class AtGatePlugin(MaiBotPlugin):
             self._get_logger().warning("消息判定失败，本次放行: %s", exc)
             return None
 
-        if not decision.identity_resolved and group_id not in self._warned_groups:
-            self._warned_groups.add(group_id)
-            self._get_logger().warning(
-                "群 %s 中无法确认机器人账号（account_id 缺失），已按 at_detection.unresolved=%s 处理；"
-                "请确认 SnowLuma/OneBot 适配器上报的 account_id 与登录 QQ 一致。",
+        if not decision.identity_resolved:
+            # 这是会导致「消息被静默丢弃」的配置问题，用 ERROR 级别并在 WebUI 上同步展示
+            first_seen = self._unresolved_groups.get(group_id)
+            if first_seen is None:
+                first_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._unresolved_groups[group_id] = first_seen
+            self._get_logger().error(
+                "【需要处理】群 %s 无法确认机器人账号（适配器未上报 account_id）：该群的非 @ 消息"
+                "正在被按 at_detection.unresolved=%s 处理，表现为「麦麦突然不理人」。"
+                "修法：让 bot_config.toml 的 qq_account 与 SnowLuma/OneBot 适配器登录的 QQ 完全一致；"
+                "若适配器确实拿不到 account_id，把 at_detection.unresolved 改成 pass 即可恢复。",
                 group_id,
                 config.at_detection.unresolved,
             )
@@ -1342,11 +1398,25 @@ class AtGatePlugin(MaiBotPlugin):
         """
 
         config = self.config
+        unresolved = dict(self._unresolved_groups)
+        unresolved_hint = ""
+        if unresolved:
+            shown = "、".join(sorted(unresolved)[:5])
+            more = f" 等 {len(unresolved)} 个群" if len(unresolved) > 5 else ""
+            unresolved_hint = (
+                f"⚠️ 有 {len(unresolved)} 个群无法确认机器人账号（适配器未上报 account_id），"
+                f"这些群的非 @ 消息正在被丢弃，表现为「麦麦突然不理人」：{shown}{more}。"
+                "处理办法：让 bot_config.toml 的 qq_account 与 SnowLuma/OneBot 适配器登录的 QQ 完全一致；"
+                "若适配器确实拿不到 account_id，把 at_detection.unresolved 改成 pass。"
+            )
         return {
             "count": len(self._whitelist) if self._whitelist is not None else 0,
             "groups": self._whitelist.snapshot() if self._whitelist is not None else [],
             "cache_session_count": self._buffer.session_count() if self._buffer is not None else 0,
             "cache_message_count": self._buffer.message_count() if self._buffer is not None else 0,
+            "cache_ttl_hours": config.context.cache_ttl_hours,
+            "unresolved_group_count": len(unresolved),
+            "unresolved_hint": unresolved_hint,
             "context_size": config.context.size,
             "mode": "drop_non_at" if config.plugin.enabled else "disabled",
             "permission_mode": config.permission.mode,
@@ -1706,13 +1776,23 @@ class AtGatePlugin(MaiBotPlugin):
             self._get_logger().warning("上下文缓存落盘失败: %s", exc)
 
     async def _flush_loop(self) -> None:
-        """后台定时把脏的上下文缓存落盘。"""
+        """后台定时淘汰过期会话，并把脏的上下文缓存落盘。"""
 
         while True:
             try:
                 interval = max(0.5, float(self.config.context.flush_interval_seconds))
                 await asyncio.sleep(interval)
-                if self._buffer is None or not self._buffer.dirty:
+                if self._buffer is None:
+                    continue
+                ttl_hours = self.config.context.cache_ttl_hours
+                pruned = self._buffer.prune_expired(float(ttl_hours) * 3600.0)
+                if pruned:
+                    self._get_logger().info(
+                        "上下文缓存按活跃度淘汰了 %d 个会话（超过 %d 小时无新消息）",
+                        pruned,
+                        ttl_hours,
+                    )
+                if not self._buffer.dirty:
                     continue
                 await self._save_buffer()
             except asyncio.CancelledError:
