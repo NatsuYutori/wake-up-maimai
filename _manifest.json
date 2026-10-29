@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.natsuyutori.wake-up-maimai",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "name": "苏醒吧麦麦！",
   "description": "控制麦麦为默认回复only@，添加到白名单群聊正常回复",
   "author": {
@@ -36,7 +36,8 @@
   "capabilities": [
     "send.text",
     "chat.open_session",
-    "maisaka.context.append"
+    "maisaka.context.append",
+    "maisaka.reply.generate"
   ],
   "i18n": {
     "default_locale": "zh-CN",

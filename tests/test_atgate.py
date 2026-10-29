@@ -105,11 +105,29 @@ class FakeContextAppender:
         return {"success": True}
 
 
+class FakeReplier:
+    """记录 Replyer 生成调用的假能力。"""
+
+    def __init__(self) -> None:
+        self.calls: List[Dict[str, Any]] = []
+        self.text = "兜底回复：在的在的～"
+        self.fail = False
+
+    async def generate(self, stream_id: str, reference: str, **kwargs: Any) -> Dict[str, Any]:
+        """记录一次生成请求。"""
+
+        self.calls.append({"stream_id": stream_id, "reference": reference, **kwargs})
+        if self.fail:
+            return {"success": False, "error": "boom"}
+        return {"success": True, "text": self.text, "selected_expression_ids": []}
+
+
 class FakeMaisaka:
     """Maisaka 能力集合。"""
 
     def __init__(self) -> None:
         self.context = FakeContextAppender()
+        self.reply = FakeReplier()
 
 
 class FakePaths:
@@ -438,6 +456,21 @@ class TestRenderContext(unittest.TestCase):
         self.assertLessEqual(len(block), 400)
         self.assertIn("已省略较早的", block)
         self.assertIn("第9条", block)
+
+    def test_custom_prefix_and_force_note(self) -> None:
+        """前缀可配置，强制回复指令追加在末尾。"""
+
+        entries = [atgate.ContextEntry(nickname="阿岚", user_id="1", text="嗨", ts=1750000000.0)]
+        block = atgate.render_context(entries, prefix="【本群最近 {count} 条】", note="必须回复这条 @")
+        self.assertIn("【本群最近 1 条】", block)
+        self.assertTrue(block.rstrip().endswith("必须回复这条 @"))
+
+    def test_bad_prefix_template_does_not_crash(self) -> None:
+        """前缀模板写错（未知占位符）时退回纯文本替换，不抛异常。"""
+
+        block = atgate.render_context([], prefix="【坏模板 {unknown}】")
+        self.assertIn("坏模板", block)
+        self.assertIn("暂无缓存消息", block)
 
 
 # ======================================================================
@@ -784,12 +817,12 @@ class TestHookBehaviour(PluginTestCase):
 
         self.run_loaded(scenario)
 
-    def test_permission_list_rejects_unlisted_user(self) -> None:
-        """permission.mode=list 时非名单用户被拒绝。"""
+    def test_permission_admin_rejects_unlisted_user(self) -> None:
+        """permission.mode=admin 时非管理员被拒绝。"""
 
         config = self.plugin.get_default_config()
-        config["permission"]["mode"] = "list"
-        config["permission"]["users"] = ["99999"]
+        config["permission"]["mode"] = "admin"
+        config["permission"]["admins"] = ["99999"]
         self.plugin.set_plugin_config(config)
 
         async def scenario(plugin: Any) -> None:
@@ -799,11 +832,40 @@ class TestHookBehaviour(PluginTestCase):
 
         self.run_loaded(scenario)
 
-    def test_permission_list_allows_listed_user(self) -> None:
-        """名单内用户可以执行命令。"""
+    def test_permission_admin_allows_listed_user(self) -> None:
+        """管理员列表内的用户可以执行命令。"""
+
+        config = self.plugin.get_default_config()
+        config["permission"]["mode"] = "admin"
+        config["permission"]["admins"] = [USER_ID]
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("/on", is_at=True, at=[BOT_QQ]))
+            self.assertTrue(plugin._whitelist.contains(GROUP_ID))
+
+        self.run_loaded(scenario)
+
+    def test_permission_admin_accepts_qq_with_nickname(self) -> None:
+        """管理员列表里写成「QQ号:昵称」也能识别。"""
+
+        config = self.plugin.get_default_config()
+        config["permission"]["mode"] = "admin"
+        config["permission"]["admins"] = [f"{USER_ID}:阿岚"]
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("/on", is_at=True, at=[BOT_QQ]))
+            self.assertTrue(plugin._whitelist.contains(GROUP_ID))
+
+        self.run_loaded(scenario)
+
+    def test_legacy_users_field_still_works(self) -> None:
+        """旧配置里只有 users 字段时，仍然按管理员名单处理。"""
 
         config = self.plugin.get_default_config()
         config["permission"]["mode"] = "list"
+        config["permission"].pop("admins", None)
         config["permission"]["users"] = [USER_ID]
         self.plugin.set_plugin_config(config)
 
@@ -813,12 +875,12 @@ class TestHookBehaviour(PluginTestCase):
 
         self.run_loaded(scenario)
 
-    def test_empty_user_list_rejects_everyone(self) -> None:
-        """mode=list 但名单为空时安全拒绝。"""
+    def test_empty_admin_list_rejects_everyone(self) -> None:
+        """mode=admin 但名单为空时安全拒绝。"""
 
         config = self.plugin.get_default_config()
-        config["permission"]["mode"] = "list"
-        config["permission"]["users"] = []
+        config["permission"]["mode"] = "admin"
+        config["permission"]["admins"] = []
         self.plugin.set_plugin_config(config)
 
         async def scenario(plugin: Any) -> None:
@@ -960,6 +1022,170 @@ class TestPersistenceAcrossReload(PluginTestCase):
         self.run_loaded(scenario)
 
 
+class TestForceReply(PluginTestCase):
+    """强制回复指令与兜底补发。"""
+
+    def test_force_note_appended_by_default(self) -> None:
+        """默认在注入内容末尾追加「必须调用 reply」指令。"""
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("在吗", is_at=True, at=[BOT_QQ]))
+            content = self.ctx.maisaka.context.calls[0]["segments"][0]["content"]
+            self.assertIn("必须调用 reply 工具", content)
+
+        self.run_loaded(scenario)
+
+    def test_force_note_and_prefix_are_configurable(self) -> None:
+        """前缀与强制指令都能在配置里改。"""
+
+        config = self.plugin.get_default_config()
+        config["context"]["prefix"] = "【自定义 {count} 条】"
+        config["reply"]["force_note"] = "（见到这条就回我一句）"
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("在吗", is_at=True, at=[BOT_QQ]))
+            content = self.ctx.maisaka.context.calls[0]["segments"][0]["content"]
+            self.assertIn("【自定义 0 条】", content)
+            self.assertIn("（见到这条就回我一句）", content)
+
+        self.run_loaded(scenario)
+
+    def test_force_off_leaves_note_out(self) -> None:
+        """关闭强制回复后不再追加指令。"""
+
+        config = self.plugin.get_default_config()
+        config["reply"]["force"] = False
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("在吗", is_at=True, at=[BOT_QQ]))
+            content = self.ctx.maisaka.context.calls[0]["segments"][0]["content"]
+            self.assertNotIn("必须调用 reply 工具", content)
+
+        self.run_loaded(scenario)
+
+    def test_at_arms_fallback_task(self) -> None:
+        """@ 放行后挂起兜底任务。"""
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("在吗", is_at=True, at=[BOT_QQ]))
+            self.assertIn(SESSION_ID, plugin._force_tokens)
+            self.assertEqual(len(plugin._force_tasks), 1)
+
+        self.run_loaded(scenario)
+
+    def test_fallback_disabled_arms_nothing(self) -> None:
+        """关闭兜底后不挂任务。"""
+
+        config = self.plugin.get_default_config()
+        config["reply"]["fallback_enabled"] = False
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("在吗", is_at=True, at=[BOT_QQ]))
+            self.assertEqual(plugin._force_tokens, {})
+            self.assertEqual(plugin._force_tasks, {})
+
+        self.run_loaded(scenario)
+
+    def test_outbound_send_cancels_fallback(self) -> None:
+        """宿主正常发出消息后清除兜底令牌。"""
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("在吗", is_at=True, at=[BOT_QQ]))
+            await plugin.handle_outbound_message(message={"session_id": SESSION_ID}, sent=True)
+            self.assertNotIn(SESSION_ID, plugin._force_tokens)
+            self.assertIn(SESSION_ID, plugin._last_outbound_at)
+
+        self.run_loaded(scenario)
+
+    def test_outbound_failure_keeps_fallback(self) -> None:
+        """发送失败不算「已经回过」。"""
+
+        async def scenario(plugin: Any) -> None:
+            await plugin.handle_incoming_message(message=make_message("在吗", is_at=True, at=[BOT_QQ]))
+            await plugin.handle_outbound_message(message={"session_id": SESSION_ID}, sent=False)
+            self.assertIn(SESSION_ID, plugin._force_tokens)
+
+        self.run_loaded(scenario)
+
+    def test_watchdog_skips_when_already_replied(self) -> None:
+        """期间已经发过消息就不补发。"""
+
+        async def scenario(plugin: Any) -> None:
+            token = "tok-replied"
+            armed_at = time.time()
+            plugin._force_tokens[SESSION_ID] = token
+            plugin._last_outbound_at[SESSION_ID] = armed_at + 1.0
+            waited: List[float] = []
+
+            async def fake_wait(seconds: float) -> None:
+                waited.append(seconds)
+
+            plugin._force_wait = fake_wait
+            await plugin._force_watchdog(SESSION_ID, make_message(), "块", token, armed_at)
+            self.assertEqual(waited, [plugin.config.reply.fallback_seconds])
+            self.assertEqual(self.ctx.maisaka.reply.calls, [])
+            self.assertEqual(self.ctx.send.sent, [])
+
+        self.run_loaded(scenario)
+
+    def test_watchdog_superseded_token_skips(self) -> None:
+        """被更新的 @ 覆盖后，旧令牌不补发。"""
+
+        async def scenario(plugin: Any) -> None:
+            plugin._force_tokens[SESSION_ID] = "newer-token"
+
+            async def fake_wait(seconds: float) -> None:
+                return None
+
+            plugin._force_wait = fake_wait
+            await plugin._force_watchdog(SESSION_ID, make_message(), "块", "older-token", time.time())
+            self.assertEqual(self.ctx.maisaka.reply.calls, [])
+
+        self.run_loaded(scenario)
+
+    def test_watchdog_generates_and_sends(self) -> None:
+        """超时未回复时调用 Replyer 生成并发送。"""
+
+        async def scenario(plugin: Any) -> None:
+            token = "tok-fire"
+
+            async def fake_wait(seconds: float) -> None:
+                return None
+
+            plugin._force_wait = fake_wait
+            plugin._force_tokens[SESSION_ID] = token
+            await plugin._force_watchdog(SESSION_ID, make_message(), "上下文块", token, time.time())
+            self.assertEqual(len(self.ctx.maisaka.reply.calls), 1)
+            self.assertEqual(self.ctx.maisaka.reply.calls[0]["stream_id"], SESSION_ID)
+            self.assertEqual(self.ctx.maisaka.reply.calls[0]["reference"], "上下文块")
+            self.assertEqual(self.ctx.send.sent[0]["text"], self.ctx.maisaka.reply.text)
+            self.assertNotIn(SESSION_ID, plugin._force_tokens)
+
+        self.run_loaded(scenario)
+
+    def test_fallback_generate_failure_does_not_send(self) -> None:
+        """生成失败时不要发出空回复。"""
+
+        self.ctx.maisaka.reply.fail = True
+
+        async def scenario(plugin: Any) -> None:
+            token = "tok-fail"
+
+            async def fake_wait(seconds: float) -> None:
+                return None
+
+            plugin._force_wait = fake_wait
+            plugin._force_tokens[SESSION_ID] = token
+            await plugin._force_watchdog(SESSION_ID, make_message(), "上下文块", token, time.time())
+            self.assertEqual(len(self.ctx.maisaka.reply.calls), 1)
+            self.assertEqual(self.ctx.send.sent, [])
+
+        self.run_loaded(scenario)
+
+
 class TestWebUiApi(PluginTestCase):
     """WebUI 页面 API。"""
 
@@ -1034,14 +1260,34 @@ class TestWebUiApi(PluginTestCase):
         self.run_loaded(scenario)
 
     def test_snapshot_reports_mode(self) -> None:
-        """快照包含当前模式与注入上限。"""
+        """快照包含当前模式、注入上限与权限模式。"""
 
         async def scenario(plugin: Any) -> None:
             snapshot = await plugin.webui_whitelist_snapshot()
             self.assertEqual(snapshot["mode"], "drop_non_at")
             self.assertEqual(snapshot["context_size"], 20)
             self.assertEqual(snapshot["cache_ttl_hours"], 72)
-            self.assertEqual(snapshot["permission_mode"], "anyone")
+            self.assertEqual(snapshot["permission_mode"], "all")
+            self.assertEqual(snapshot["permission_mode_label"], "all")
+            self.assertIn("任何群成员", snapshot["permission_hint"])
+            self.assertTrue(snapshot["force_reply"])
+            self.assertTrue(snapshot["force_fallback"])
+
+        self.run_loaded(scenario)
+
+    def test_snapshot_reports_admin_mode(self) -> None:
+        """切到 admin 后快照给出管理员人数与提示。"""
+
+        config = self.plugin.get_default_config()
+        config["permission"]["mode"] = "admin"
+        config["permission"]["admins"] = ["10001", "10002"]
+        self.plugin.set_plugin_config(config)
+
+        async def scenario(plugin: Any) -> None:
+            snapshot = await plugin.webui_whitelist_snapshot()
+            self.assertEqual(snapshot["permission_mode"], "admin")
+            self.assertEqual(snapshot["admin_count"], 2)
+            self.assertIn("2 个白名单管理员", snapshot["permission_hint"])
 
         self.run_loaded(scenario)
 

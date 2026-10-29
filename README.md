@@ -2,23 +2,24 @@
 
 > 控制麦麦为默认回复 only@，添加到白名单群聊正常回复。
 
-MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响应群里的 @ 消息**，被 @ 时把该群最近 20 条聊天记录注入 Maisaka 上下文；通过群内命令或 WebUI 页面维护白名单，白名单群内插件完全退出、麦麦按原生逻辑参与聊天。
+MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响应群里的 @ 消息**，被 @ 时把该群最近 20 条聊天记录注入 Maisaka 上下文，并**强制麦麦必须回复**（指令 + 超时兜底补发）；通过群内命令或 WebUI 页面维护白名单，白名单群内插件完全退出、麦麦按原生逻辑参与聊天。
 
 ## 行为表
 
 | 群状态 | 普通消息（不 @） | @ 麦麦 |
 |---|---|---|
-| 默认（不在白名单） | **直接丢弃**：不入库、不进 Maisaka、不回复 | 注入该群最近 N 条消息后放行，由 Maisaka 正常回复 |
+| 默认（不在白名单） | **直接丢弃**：不入库、不进 Maisaka、不回复 | 注入该群最近 N 条消息并追加强制回复指令后放行；若 45 秒内还没发出消息，插件调用 Replyer 补发一条 |
 | 在白名单 | 插件完全不介入，Maisaka 原生处理（可主动接话） | 插件完全不介入（**不注入**），Maisaka 原生处理 |
 
 群内 `@麦麦 /on` 把本群加入白名单，`@麦麦 /off` 移出；WebUI 插件页可做同样的事，两边共享同一份持久化数据。
 
-## ⚠️ 装好后请先确认这两个默认值
+## ⚠️ 装好后请先确认这几个默认值
 
 | 配置项 | 默认 | 为什么要看一眼 |
 |---|---|---|
 | `at_detection.unresolved` | `drop` | 适配器**不上报 `account_id`** 时，插件认不出「哪条 @ 是我」，会把该群的非 @ 消息当普通消息丢弃，外在表现就是「**麦麦突然不理人**」。此时日志会打 **ERROR「【需要处理】群 xxx 无法确认机器人账号」**，WebUI 页面顶部也会出现红色提示条。修法见 [排障](#排障)。 |
-| `permission.mode` | `anyone` | 默认**任何群成员**都能 `@麦麦 /on` 把整个群加进白名单、让麦麦开始全天候接话。只想让少数人改动白名单时，改成 `list` 并填 `permission.users`。 |
+| `permission.mode` | `all` | 默认**任何群成员**都能 `@麦麦 /on` 把整个群加进白名单、让麦麦开始全天候接话。只想让少数人改动白名单时，把下拉框切成 `admin`，并在 `permission.admins` 里填 QQ 号。 |
+| `reply.force` + `reply.fallback_enabled` | 都开启 | 被 @ 时不光要"放行"，还要求**一定有回复**。这两个开关一起决定「指令强制 + 超时兜底补发」，代价见 [强制回复](#强制回复被--时一定有回应)。 |
 
 ## 环境要求
 
@@ -51,13 +52,26 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 - 必须 **@ 机器人** 才生效；不带 @ 的 `/on` 只是普通聊天内容。
 - 命令词可在配置里改（`command.on_words` / `off_words`），支持多别名。
 - 命令消息本身会被拦截，不会进入 Maisaka，所以麦麦不会「回答」你的命令；插件会回一条确认（可关）。
-- 权限：默认任何群成员都能切换；把 `permission.mode` 改成 `list` 并填 `permission.users`（QQ 号列表）即可收紧。`list` 但名单为空时会拒绝所有人并打 WARNING（防止误配成全员可操作）。
+- 权限：默认 `all`，任何群成员都能切换；想收紧就把 `permission.mode` 切成 `admin`，在 `permission.admins` 里填 QQ 号（一个一行，写成 `123456` 或 `123456:昵称` 都行）。`admin` 但名单为空时会拒绝所有人并打 WARNING（防止误配成全员可操作）。旧版本的 `permission.users` 字段会自动迁移成 `admins`。
+
+## 强制回复（被 @ 时一定有回应）
+
+默认开启，两层机制：
+
+1. **指令强制**：注入的聊天记录末尾会追加一段 `reply.force_note`（可改、可清空），明确要求"本轮必须调用 reply 工具回复这条 @ 消息，不允许沉默"。因为是在放行路径上做，消息仍走 MaiBot 正常流程（历史入库、记忆、工具都能用）。
+2. **超时兜底**：放行后插件挂一个计时器，`reply.fallback_seconds`（默认 45 秒）内该群**一条消息都没发出**，就调用宿主 Replyer（`maisaka.reply.generate`，复用麦麦人格与表达方式）生成一条简短回复，再用 `send.text` 直接发出去。兜底内容不经过 Planner，风格/记忆比正常回复略弱；把它当成"至少不会石沉大海"的保险。
+
+注意两点：
+
+- 兜底是"没检测到任何出站消息"才触发，所以正常情况下不会多说话；但如果你把 `fallback_seconds` 调得很短，而麦麦恰好在那之后才回复，群里会出现两条。默认 45 秒足够覆盖正常的思考 + 打字延迟。
+- `reply.force = false` 会同时关掉这两层，回到"只放行、不保证回复"。
 
 ## WebUI 页面
 
 页面提供：
 
-- **统计**：白名单群数、已缓存会话数、已缓存消息数
+- **统计**：白名单群数、已缓存会话数、已缓存消息数、当前命令权限模式
+- **权限提示**：一行文字说明当前是 `all` 还是 `admin`（含管理员人数），切模式后立刻反映
 - **添加**：填群号（必填）、群名（可选）、备注（可选）→ 加入白名单
 - **表格**：点击某行打开详情，可在详情里「移出白名单」（二次确认）
 - **清空白名单**、**清空上下文缓存**（均有二次确认）
@@ -72,6 +86,7 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 |---|---|---|
 | `plugin.enabled` | `true` | 总开关。关闭后插件完全不介入（连命令也不生效），所有群恢复原生行为 |
 | `context.size` | `20` | 被 @ 时注入的最近消息条数，同时是每群缓存上限（1–50） |
+| `context.prefix` | `【群聊最近 {count} 条消息（插件缓存，按时间正序）】{omitted}` | 注入内容的**提示词前缀/标题**，支持 `{count}` 与 `{omitted}` 占位符，留空用默认 |
 | `context.include_bot_messages` | `false` | 机器人自己的消息是否计入缓存（多数适配器不回显，保持关闭） |
 | `context.message_max_chars` | `300` | 注入文本里单条消息的截断长度 |
 | `context.max_total_chars` | `4000` | 整块注入文本上限，超出时从最旧的消息开始省略 |
@@ -82,8 +97,13 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 | `command.off_words` | `["/off"]` | 移出白名单的命令词 |
 | `command.reply_on_toggle` | `true` | 执行命令后是否群里回执 |
 | `command.reply_added` / `reply_removed` / `reply_already` / `reply_not_in` / `reply_denied` | 内置文案 | 五种回执文本 |
-| `permission.mode` | `anyone` | `anyone`=任何群成员；`list`=仅 `users` 内 QQ |
-| `permission.users` | `[]` | `mode=list` 时生效 |
+| `permission.mode` | `all` | `all`=任何群成员都能切换白名单；`admin`=仅 `permission.admins` 内的 QQ 号可以 |
+| `permission.admins` | `[]` | `mode=admin` 时的管理员 QQ 号列表（支持 `123456`、`123456:昵称` 两种写法） |
+| `reply.force` | `true` | 被 @ 时是否在注入内容末尾追加强制回复指令 |
+| `reply.force_note` | 内置文案 | 追加的强制回复指令正文，可改成你喜欢的话术，留空则不加 |
+| `reply.fallback_enabled` | `true` | 是否启用超时兜底补发 |
+| `reply.fallback_seconds` | `45` | 兜底等待秒数（10–300）：这么久没发出消息才补发 |
+| `reply.fallback_instruction` | 内置文案 | 兜底生成时追加给 Replyer 的写作要求（默认要求简短口语化） |
 | `at_detection.unresolved` | `drop` | 拿不到机器人账号时：`drop`=按非 @ 处理，`pass`=放行 |
 
 ## 数据与隐私
@@ -107,6 +127,7 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 - **为什么不用 `@Command`**：宿主用 `processed_plain_text` 做 `search` 匹配，而 @ 段会被渲染成 `@名片` 前缀，`^/on$` 匹配不到 `@麦麦 /on`。所以命令在 Hook 内解析 `raw_message` 的文本段（先剥 @ 前缀，再整串比对，避免 `/once` 误命中）。
 - **首次 @ 的会话**：群里第一条消息就是 @ 时，宿主还没有该群会话；插件先 `chat.open_session` 建流（群会话 ID 只由 platform/account_id/scope/group_id 决定，与发送者无关），再 `maisaka.context.append` 注入并重试。
 - **注入失败不阻断**：注入超时 / 被策略拒绝时只打 WARNING，@ 消息照常放行，退化为「无上下文的正常回复」。
+- **强制回复的两层**：提示词层只是往 `maisaka.context.append` 的文本块末尾追加指令（零风险）；兜底层用 `send_service.after_send`（观察模式 Hook）判断该会话在等待窗口内是否真的发出了消息——发出就清令牌取消兜底，没发出才调 `maisaka.reply.generate` + `send.text` 补一条。
 - **单文件实现**：插件加载器按文件路径导入 `plugin.py`，不会把插件目录加入 `sys.path`，所以逻辑全部放在单文件内，测试通过 `importlib` 从路径加载。
 
 ## 验收清单
@@ -124,6 +145,9 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 9. 重启 MaiBot（白名单与缓存都还在，页面数据不变）。
 10. 私聊机器人、群内戳一戳等通知消息不受影响；发图片 / 表情 / 引用消息不报错。
 11. 把 `context.cache_ttl_hours` 临时改成 `0` 之外的小值（如 `1`）并等待后台任务，日志出现「上下文缓存按活跃度淘汰」，页面「缓存会话数」下降（验证自动过期）。
+12. 把 `permission.mode` 切成 `admin`、`permission.admins` 只填自己：自己 `@麦麦 /off` 生效，换个小号再试会被拒绝并收到「没有权限」回执（页面顶部提示同步变成 admin 文案）。
+13. 兜底验证：临时把 `reply.fallback_seconds` 调到 `10`、并在 MaiBot 里让该群回复频率为 0（或直接不回复），`@麦麦 在吗` 后约 10 秒，日志出现「已由插件调用 Replyer 补发一条回复」，群里收到一条回复。
+14. 把 `context.prefix` 改成 `【本群最近 {count} 条】` 后 `@麦麦`，在 Maisaka 上下文里能看到自定义前缀；`reply.force_note` 改动同样生效。
 
 ## 排障
 
@@ -131,7 +155,9 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 |---|---|
 | 机器人完全不回复任何消息 | 插件 `enabled` 是否为 true；该群是否在白名单（白名单群不走本插件，但 MaiBot 本身也可能因频率/策略不回复）；看日志有没有「无法确认机器人账号」 |
 | @ 了也不回复 | 日志 **ERROR「【需要处理】群 xxx 无法确认机器人账号」** 说明 `account_id` 缺失或不一致：核对 `bot_config.toml` 的 `qq_account` 与 SnowLuma 里登录的 QQ；WebUI 页面顶部也会出现同一条红色提示，列出受影响的群。也可临时把 `at_detection.unresolved` 设为 `pass` 验证 |
-| 命令没反应 | 是否 @ 了机器人；`command.on_words` 是否被改；`permission.mode=list` 时自己是否在 `permission.users` 里（日志会写「权限不足」） |
+| 命令没反应 | 是否 @ 了机器人；`command.on_words` 是否被改；`permission.mode=admin` 时自己是否在 `permission.admins` 里（日志会写「权限不足」，群里会收到无权限回执） |
+| 被 @ 了但还是没回复 | 先看日志有没有「已由插件调用 Replyer 补发一条回复」：有说明兜底生效了；没有则检查 `reply.force` / `reply.fallback_enabled` 是否被关、宿主是否支持 `maisaka.reply.generate` 能力（MaiBot 1.3.x 自带）；若两处都正常仍无回复，再看 `chat.reply_timing.talk_value` 是否被设为 0 |
+| 同一个 @ 收到两条回复 | 兜底超时时间太短，而麦麦在那之后才发出正常回复。把 `reply.fallback_seconds` 调大（默认 45 秒），或关掉 `reply.fallback_enabled` 只用指令强制 |
 | 被 @ 有回复但没有历史上下文 | 日志有「上下文注入失败」：首次建流失败或适配器策略拒绝；群里先随便聊几条再 @ 试试 |
 | WebUI 加群报「群号应为 5-12 位数字」 | 群号只接受数字，注意不要带空格或 `群` 字样 |
 | 页面显示空白 | 插件是否启用、是否被宿主判定 WebUI 协议校验失败（查看插件加载日志） |
@@ -142,7 +168,7 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 # 依赖：插件 SDK（含 pydantic）
 pip install maibot-plugin-sdk
 
-# 单元测试（63 个用例，全部使用假宿主，不连接 MaiBot）
+# 单元测试（84 个用例，全部使用假宿主，不连接 MaiBot）
 python -m unittest discover -s tests -v
 
 # 静态检查
@@ -151,7 +177,7 @@ python -m json.tool _manifest.json > /dev/null
 python -m json.tool webui.json > /dev/null
 ```
 
-测试覆盖：@ 判定（`is_at` 标志 / @ 段与 `account_id` 比对 / 账号缺失）、命令解析（含 `@名片` 前缀、`/once` 不误命中）、环形缓存（截断 / LRU / 落盘往返 / 损坏恢复）、白名单（幂等 / 持久化 / 非法群号）、决策分支（私聊 / 通知 / 白名单 / 丢弃 / 注入）、注入失败降级、WebUI API 增删查清。
+测试覆盖：@ 判定（`is_at` 标志 / @ 段与 `account_id` 比对 / 账号缺失）、命令解析（含 `@名片` 前缀、`/once` 不误命中）、环形缓存（截断 / LRU / 落盘往返 / 损坏恢复 / TTL 淘汰）、白名单（幂等 / 持久化 / 非法群号）、决策分支（私聊 / 通知 / 白名单 / 丢弃 / 注入）、注入失败降级、强制回复（指令注入 / 兜底触发 / 已回复则取消 / 生成失败不外发）、权限模式（all / admin / 旧 `users` 字段迁移）、WebUI API 增删查清。
 
 ## 已知限制
 
@@ -160,8 +186,15 @@ python -m json.tool webui.json > /dev/null
 - 不校验群管理员身份（只支持 QQ 号名单），避免依赖适配器私有接口。
 - 被丢弃的消息不会进入 MaiBot 的任何历史、记忆、学习与统计。
 - 缓存内容只有文本与占位符，20 条窗口是插件自己的缓存，不等同于宿主完整聊天记录。
+- 兜底回复由 `maisaka.reply.generate`（Replyer 长文生成链路）产出，**不经过 Planner**，因此不会调用工具、也不会走正常 Agent 记忆检索；它只是保证"有回应"的保险，正常回复仍以 Planner 为主。
 
 ## 更新日志
+
+### 1.2.0
+- 新增 `permission.mode` 的 `all` / `admin` 两种模式与 `permission.admins` 管理员名单：默认 `all`（任何群成员可切换白名单），切成 `admin` 后只有名单内 QQ 号能执行 `@麦麦 /on`、`/off`；旧版 `users` 字段自动迁移。
+- 新增 `context.prefix`：注入给 Maisaka 的提示词前缀可配置（支持 `{count}` / `{omitted}` 占位符）。
+- 新增「强制回复」：`reply.force` 在注入内容末尾追加可配置的「必须调用 reply 工具」指令；`reply.fallback_enabled` + `reply.fallback_seconds` 在超时未回复时调用 Replyer 生成并补发一条，确保 @ 一定有回应。
+- WebUI 页面新增「命令权限」统计与权限模式说明，折叠说明区补充强制回复机制。
 
 ### 1.1.0
 - 新增 `context.cache_ttl_hours`（默认 72 小时）：按活跃度自动淘汰长期没有新消息的群缓存，后台定时执行，启动时也会先清理一次；`context_cache.json` 不再无限增长，设 `0` 可关闭。

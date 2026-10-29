@@ -2,9 +2,11 @@
 
 行为约定：
 - 默认（群不在白名单）：群内**非 @** 消息在入库与入站之前被丢弃，机器人不会看到；
-  被 @ 时把该群最近 N 条消息注入 Maisaka 上下文，然后放行由 Maisaka 正常回复。
+  被 @ 时把该群最近 N 条消息注入 Maisaka 上下文，并追加强制回复指令后放行由 Maisaka 正常回复；
+  若 ``reply.fallback_seconds`` 内该群仍没有发出任何消息，插件调用 Replyer 生成一条并补发。
 - 白名单群：插件对入站消息完全不做处理，Maisaka 走原生逻辑（含主动回复）。
-- 白名单可在群内用 @麦麦 /on、/off 切换，也可在 WebUI 页面增删，两者共享同一份数据。
+- 白名单可在群内用 @麦麦 /on、/off 切换，也可在 WebUI 页面增删，两者共享同一份数据；
+  谁能执行命令由 ``permission.mode``（all / admin）与 ``permission.admins`` 决定。
 
 实现要点：
 - 丢弃只能发生在 Hook 阶段：abort 发生在 ``chat_manager.register_message`` 与文件入库之前，
@@ -25,6 +27,7 @@ import os
 import re
 import time
 import unicodedata
+import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,12 +37,25 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tu
 from maibot_sdk import API, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
+try:  # pydantic 2 是 SDK 的硬依赖，这里只是防御性兜底
+    from pydantic import model_validator
+except ImportError:  # pragma: no cover - 理论上不会发生
+    model_validator = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 PLUGIN_ID = "github.natsuyutori.wake-up-maimai"
 STATE_VERSION = 1
 WHITELIST_FILENAME = "whitelist.json"
 CONTEXT_CACHE_FILENAME = "context_cache.json"
+
+# 注入内容默认前缀；支持 {count}（条数）与 {omitted}（省略提示）两个占位符
+DEFAULT_CONTEXT_PREFIX = "【群聊最近 {count} 条消息（插件缓存，按时间正序）】{omitted}"
+# 默认的强制回复指令，追加在注入内容末尾
+DEFAULT_FORCE_NOTE = (
+    "（上面是最近的群聊记录。这条消息明确 @ 了你：本轮必须调用 reply 工具直接回应，"
+    "不允许沉默、不允许只思考不回复。）"
+)
 
 # QQ 群号：5-12 位数字，且不以 0 开头
 _GROUP_ID_RE = re.compile(r"^[1-9]\d{4,11}$")
@@ -397,9 +413,31 @@ def decide_message(
     return Decision(AT_PASS, identity_resolved=identity_resolved)
 
 
+def format_context_prefix(template: str, count: int, omitted: str = "") -> str:
+    """按占位符渲染注入前缀，模板本身有问题时退回默认前缀。
+
+    Args:
+        template: 含 ``{count}`` / ``{omitted}`` 占位符的模板。
+        count: 本次渲染的条数。
+        omitted: 省略提示文本。
+
+    Returns:
+        str: 渲染后的前缀文本。
+    """
+
+    text = (template or "").strip() or DEFAULT_CONTEXT_PREFIX
+    try:
+        return text.format(count=count, omitted=omitted)
+    except (KeyError, IndexError, ValueError):
+        # 用户模板里有多余的 { 或未知占位符：退化为纯文本替换，不能因为配置写错就崩
+        return text.replace("{count}", str(count)).replace("{omitted}", omitted)
+
+
 def render_context(
     entries: Sequence["ContextEntry"],
     *,
+    prefix: str = DEFAULT_CONTEXT_PREFIX,
+    note: str = "",
     max_total_chars: int = 4000,
     message_max_chars: int = 300,
 ) -> str:
@@ -409,6 +447,8 @@ def render_context(
 
     Args:
         entries: 按时间正序排列的缓存消息。
+        prefix: 前缀模板，支持 ``{count}`` 与 ``{omitted}`` 占位符。
+        note: 追加在整块文本末尾的指令（用于强制回复）。
         max_total_chars: 整块文本的字符上限。
         message_max_chars: 单条消息的字符上限。
 
@@ -416,8 +456,9 @@ def render_context(
         str: 供 ``maisaka.context.append`` 使用的文本。
     """
 
+    tail = ("\n" + note.strip()) if (note and note.strip()) else ""
     if not entries:
-        return "【群聊最近消息（插件缓存）】\n（暂无缓存消息）"
+        return format_context_prefix(prefix, 0) + "\n（暂无缓存消息）" + tail
 
     lines: List[str] = []
     for entry in entries:
@@ -432,16 +473,18 @@ def render_context(
         lines.append(f"{stamp} {speaker}：{text}")
 
     omitted = 0
-    header = "【群聊最近 {count} 条消息（插件缓存，按时间正序）】{omitted}"
-    while lines:
-        total = len(header.format(count=len(lines), omitted=(f"（已省略较早的 {omitted} 条）" if omitted else ""))) + 1
-        total += sum(len(line) + 1 for line in lines)
-        if total <= max_total_chars:
+    while True:
+        header = format_context_prefix(
+            prefix,
+            len(lines),
+            f"（已省略较早的 {omitted} 条）" if omitted else "",
+        )
+        total = len(header) + 1 + sum(len(line) + 1 for line in lines)
+        if total <= max_total_chars or len(lines) <= 1:
             break
         lines.pop(0)
         omitted += 1
-    block = header.format(count=len(lines), omitted=(f"（已省略较早的 {omitted} 条）" if omitted else ""))
-    return block + "\n" + "\n".join(lines)
+    return header + "\n" + "\n".join(lines) + tail
 
 
 # ======================================================================
@@ -475,6 +518,14 @@ class ContextSectionConfig(PluginConfigBase):
         ge=1,
         le=50,
         description="被 @ 时注入的最近消息条数，同时也是每个群缓存的消息上限。",
+    )
+    prefix: str = Field(
+        default=DEFAULT_CONTEXT_PREFIX,
+        max_length=200,
+        description=(
+            "注入内容的前缀/标题，支持 {count}（条数）与 {omitted}（省略提示）两个占位符；"
+            "留空则使用默认前缀。"
+        ),
     )
     include_bot_messages: bool = Field(
         default=False,
@@ -560,17 +611,74 @@ class CommandSectionConfig(PluginConfigBase):
 class PermissionSectionConfig(PluginConfigBase):
     """命令权限配置。"""
 
-    __ui_label__ = "权限"
+    __ui_label__ = "命令权限"
     __ui_icon__ = "lock"
     __ui_order__ = 3
 
     mode: str = Field(
-        default="anyone",
-        description="anyone=任何群成员都能切换白名单；list=仅 permission.users 内的 QQ 号可以。",
+        default="all",
+        description=(
+            "all=任何群成员都能用 @麦麦 /on、/off 切换白名单（默认）；"
+            "admin=仅 admins 列表里的 QQ 号可以，其他人发命令会收到无权限提示。"
+        ),
     )
-    users: List[str] = Field(
+    admins: List[str] = Field(
         default_factory=list,
-        description="当 mode=list 时生效的 QQ 号列表。列表为空时所有命令都会被拒绝。",
+        description="mode=admin 时允许操作白名单的 QQ 号列表。列表为空时所有 /on、/off 都会被拒绝。",
+    )
+
+    if model_validator is not None:
+
+        @model_validator(mode="before")
+        @classmethod
+        def _migrate_legacy_users(cls, data: Any) -> Any:
+            """兼容 1.1.0 及更早版本的 ``permission.users`` 字段。"""
+
+            if isinstance(data, dict):
+                merged = dict(data)
+                legacy = merged.pop("users", None)
+                if legacy and not merged.get("admins"):
+                    merged["admins"] = legacy
+                return merged
+            return data
+
+
+class ReplySectionConfig(PluginConfigBase):
+    """强制回复配置。"""
+
+    __ui_label__ = "强制回复"
+    __ui_icon__ = "reply"
+    __ui_order__ = 4
+
+    force: bool = Field(
+        default=True,
+        description="被 @ 时是否强制麦麦必须回复：在注入的聊天记录末尾追加一段「必须调用 reply 工具」的指令。",
+    )
+    force_note: str = Field(
+        default=DEFAULT_FORCE_NOTE,
+        max_length=2000,
+        description="force=true 时追加在注入内容末尾的指令文本；留空则不加。",
+    )
+    fallback_enabled: bool = Field(
+        default=True,
+        description=(
+            "兜底：如果指令发出后在 fallback_seconds 内该群一条消息都没发出去，"
+            "插件直接调用 Replyer 生成一条回复并发送，保证 @ 一定有回应。"
+        ),
+    )
+    fallback_seconds: float = Field(
+        default=45.0,
+        ge=10.0,
+        le=300.0,
+        description="兜底等待时间（秒）：这段时间内该群没有任何消息发出，才补发兜底回复。",
+    )
+    fallback_instruction: str = Field(
+        default=(
+            "请用一条简短、口语化的群聊回复回应对方刚刚的 @，不要写成文章、不要书面语，"
+            "直接给出正文，不要加任何前后缀说明。"
+        ),
+        max_length=2000,
+        description="兜底生成时追加给 Replyer 的写作要求。",
     )
 
 
@@ -579,7 +687,7 @@ class AtDetectionSectionConfig(PluginConfigBase):
 
     __ui_label__ = "判定与兼容"
     __ui_icon__ = "scan-eye"
-    __ui_order__ = 4
+    __ui_order__ = 5
 
     unresolved: str = Field(
         default="drop",
@@ -597,6 +705,7 @@ class AtGateConfig(PluginConfigBase):
     context: ContextSectionConfig = Field(default_factory=ContextSectionConfig)
     command: CommandSectionConfig = Field(default_factory=CommandSectionConfig)
     permission: PermissionSectionConfig = Field(default_factory=PermissionSectionConfig)
+    reply: ReplySectionConfig = Field(default_factory=ReplySectionConfig)
     at_detection: AtDetectionSectionConfig = Field(default_factory=AtDetectionSectionConfig)
 
 
@@ -674,6 +783,21 @@ def normalize_group_id(value: Any) -> str:
     if not _GROUP_ID_RE.match(text):
         raise ValueError("群号应为 5-12 位数字，例如 123456789")
     return text
+
+
+def normalize_qq(value: Any) -> str:
+    """把配置里的 QQ 号规整成纯数字字符串（兼容 ``123456:昵称`` 这类写法）。
+
+    Args:
+        value: 原始配置值。
+
+    Returns:
+        str: 规整后的 QQ 号；无法识别时返回去空白后的原文。
+    """
+
+    text = str(value or "").strip()
+    match = re.match(r"^(\d+)", text)
+    return match.group(1) if match else text
 
 
 def _trim_text(value: Any, limit: int) -> str:
@@ -1225,6 +1349,12 @@ class AtGatePlugin(MaiBotPlugin):
         self._mutation_lock = asyncio.Lock()
         # 群号 -> 首次发现身份无法确认的时间，用于 WebUI 展示与去重告警
         self._unresolved_groups: Dict[str, str] = {}
+        # 兜底强制回复：会话 ID -> 本次 @ 的令牌，用来判断是否已被更新的 @ 覆盖
+        self._force_tokens: Dict[str, str] = {}
+        # 令牌 -> 后台兜底任务，卸载时统一取消
+        self._force_tasks: Dict[str, asyncio.Task] = {}
+        # 会话 ID -> 最近一次成功发出消息的时间戳，用于判断「是否已经回过」
+        self._last_outbound_at: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -1262,17 +1392,26 @@ class AtGatePlugin(MaiBotPlugin):
         self._loaded = True
         self._flush_task = asyncio.create_task(self._flush_loop(), name="atgate-context-flush")
         self._get_logger().info(
-            "苏醒吧麦麦！已加载：白名单 %d 个群，缓存 %d 个会话 / %d 条消息，注入上限 %d 条",
+            "苏醒吧麦麦！已加载：白名单 %d 个群，缓存 %d 个会话 / %d 条消息，注入上限 %d 条；"
+            "命令权限=%s，强制回复=%s，超时兜底=%s（%d 秒）",
             len(self._whitelist),
             self._buffer.session_count(),
             self._buffer.message_count(),
             config.context.size,
+            "admin" if str(config.permission.mode or "").strip().lower() in ("admin", "list") else "all",
+            "开" if config.reply.force else "关",
+            "开" if (config.reply.force and config.reply.fallback_enabled) else "关",
+            int(config.reply.fallback_seconds),
         )
 
     async def on_unload(self) -> None:
-        """卸载插件：停止落盘任务并把状态刷盘。"""
+        """卸载插件：停止落盘任务、取消兜底任务并把状态刷盘。"""
 
         self._loaded = False
+        for task in list(self._force_tasks.values()):
+            task.cancel()
+        self._force_tasks.clear()
+        self._force_tokens.clear()
         if self._flush_task is not None:
             self._flush_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1380,10 +1519,47 @@ class AtGatePlugin(MaiBotPlugin):
             await self._toggle("off", message)
             return {"action": "abort"}
         if decision.action == AT_PASS:
-            await self._inject_context(message)
+            block = await self._inject_context(message)
             self._record(message)
+            self._arm_force_fallback(message, block)
             return None
         return None
+
+    # ------------------------------------------------------------------
+    # 出站观察：判断「麦麦是否已经回过话」，用于取消兜底
+    # ------------------------------------------------------------------
+
+    @HookHandler(
+        "send_service.after_send",
+        name="at_gate_outbound",
+        description="苏醒吧麦麦！：记录出站消息，用于判断 @ 是否已经被正常回复",
+        mode=HookMode.OBSERVE,
+        order=HookOrder.NORMAL,
+        timeout_ms=2000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_outbound_message(
+        self,
+        message: Optional[Dict[str, Any]] = None,
+        sent: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """观察发送结果：成功发出消息即认为该会话已经回过话。
+
+        Args:
+            message: 本次发送消息的序列化字典。
+            sent: 是否发送成功。
+            **kwargs: 宿主可能附带的其它字段。
+        """
+
+        if not self._loaded or not sent or not isinstance(message, dict):
+            return
+        session_id = str(message.get("session_id") or "").strip()
+        if not session_id:
+            return
+        self._last_outbound_at[session_id] = time.time()
+        # 已经发出过消息，本轮的兜底回复没必要再补
+        self._force_tokens.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # WebUI 页面 API
@@ -1409,6 +1585,18 @@ class AtGatePlugin(MaiBotPlugin):
                 "处理办法：让 bot_config.toml 的 qq_account 与 SnowLuma/OneBot 适配器登录的 QQ 完全一致；"
                 "若适配器确实拿不到 account_id，把 at_detection.unresolved 改成 pass。"
             )
+        perm_mode = str(config.permission.mode or "all").strip().lower()
+        perm_mode = "admin" if perm_mode in ("admin", "list") else "all"
+        admin_count = len({normalize_qq(item) for item in list(config.permission.admins or []) if normalize_qq(item)})
+        if perm_mode == "admin":
+            permission_hint = (
+                f"当前权限模式：admin —— 只有 {admin_count} 个白名单管理员可以用 @麦麦 /on、/off"
+                "（名单在插件配置的「命令权限」里填写）。"
+            )
+            if admin_count == 0:
+                permission_hint = "当前权限模式：admin，但管理员名单是空的，所有 /on、/off 都会被拒绝，请先填写 QQ 号。"
+        else:
+            permission_hint = "当前权限模式：all —— 任何群成员都可以用 @麦麦 /on、/off 切换白名单。"
         return {
             "count": len(self._whitelist) if self._whitelist is not None else 0,
             "groups": self._whitelist.snapshot() if self._whitelist is not None else [],
@@ -1419,7 +1607,12 @@ class AtGatePlugin(MaiBotPlugin):
             "unresolved_hint": unresolved_hint,
             "context_size": config.context.size,
             "mode": "drop_non_at" if config.plugin.enabled else "disabled",
-            "permission_mode": config.permission.mode,
+            "permission_mode": perm_mode,
+            "permission_mode_label": "admin" if perm_mode == "admin" else "all",
+            "admin_count": admin_count,
+            "permission_hint": permission_hint,
+            "force_reply": bool(config.reply.force),
+            "force_fallback": bool(config.reply.force and config.reply.fallback_enabled),
             "enabled": config.plugin.enabled,
         }
 
@@ -1554,22 +1747,30 @@ class AtGatePlugin(MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001 - 缓存失败不应影响消息处理
             self._get_logger().warning("写入上下文缓存失败: %s", exc)
 
-    async def _inject_context(self, message: Dict[str, Any]) -> None:
+    async def _inject_context(self, message: Dict[str, Any]) -> str:
         """把该群最近 N 条消息注入 Maisaka 上下文。
 
         Args:
             message: Hook 载荷中的消息字典。
+
+        Returns:
+            str: 实际注入的文本块（注入失败时仍返回渲染结果，供兜底生成复用）。
         """
 
         if self._buffer is None:
-            return
+            return ""
         session_id = str(message.get("session_id") or "").strip()
         if not session_id:
-            return
+            return ""
         config = self.config
         entries = self._buffer.recent(session_id, config.context.size)
+        note = ""
+        if config.reply.force and config.reply.force_note.strip():
+            note = config.reply.force_note
         block = render_context(
             entries,
+            prefix=config.context.prefix,
+            note=note,
             max_total_chars=config.context.max_total_chars,
             message_max_chars=config.context.message_max_chars,
         )
@@ -1585,6 +1786,7 @@ class AtGatePlugin(MaiBotPlugin):
                 "群 %s 的上下文注入失败，本次 @ 仍会正常回复，但没有历史上下文",
                 group_id_of(message),
             )
+        return block
 
     async def _append_context(
         self,
@@ -1677,6 +1879,143 @@ class AtGatePlugin(MaiBotPlugin):
         if sent is False:
             self._get_logger().warning("群 %s 命令回执发送失败（宿主返回 False）", group_id_of(message))
 
+    # ------------------------------------------------------------------
+    # 兜底强制回复：@ 之后一段时间内没有发出任何消息，就由插件补一条
+    # ------------------------------------------------------------------
+
+    def _arm_force_fallback(self, message: Dict[str, Any], block: str) -> None:
+        """在 @ 放行后挂一个兜底任务：超时仍未发出消息就调用 Replyer 补一条回复。
+
+        Args:
+            message: Hook 载荷中的消息字典。
+            block: 本次注入的上下文文本，兜底生成时作为写作材料。
+        """
+
+        if not self._loaded:
+            return
+        config = self.config.reply
+        if not config.force or not config.fallback_enabled:
+            return
+        session_id = str(message.get("session_id") or "").strip()
+        if not session_id:
+            return
+        token = uuid.uuid4().hex
+        armed_at = time.time()
+        self._force_tokens[session_id] = token
+        task = asyncio.create_task(
+            self._force_watchdog(session_id, message, block, token, armed_at),
+            name=f"atgate-force-{session_id}",
+        )
+        self._force_tasks[token] = task
+        task.add_done_callback(lambda _task: self._force_tasks.pop(token, None))
+
+    async def _force_watchdog(
+        self,
+        session_id: str,
+        message: Dict[str, Any],
+        block: str,
+        token: str,
+        armed_at: float,
+    ) -> None:
+        """等待兜底时间，期间该会话没有发出消息才补发。
+
+        Args:
+            session_id: 会话 ID。
+            message: Hook 载荷中的消息字典。
+            block: 注入的上下文文本。
+            token: 本次 @ 的令牌。
+            armed_at: 挂起兜底的时刻。
+        """
+
+        try:
+            await self._force_wait(float(self.config.reply.fallback_seconds))
+            if not self._loaded:
+                return
+            if self._force_tokens.get(session_id) != token:
+                # 已经被更新的 @ 覆盖，或期间正常回复发出后被清理
+                return
+            if self._last_outbound_at.get(session_id, 0.0) >= armed_at:
+                return
+            self._force_tokens.pop(session_id, None)
+            await self._force_generate_and_send(session_id, message, block)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 - 兜底失败只记日志
+            self._get_logger().warning("群 %s 的兜底回复异常: %s", group_id_of(message), exc)
+
+    async def _force_wait(self, seconds: float) -> None:
+        """兜底等待；单独抽成方法，便于测试时替换成瞬时返回。
+
+        Args:
+            seconds: 等待秒数。
+        """
+
+        await asyncio.sleep(seconds)
+
+    async def _force_generate_and_send(
+        self,
+        session_id: str,
+        message: Dict[str, Any],
+        block: str,
+    ) -> None:
+        """调用 Replyer 生成一条回复并发送（兜底路径）。
+
+        Args:
+            session_id: 会话 ID。
+            message: Hook 载荷中的消息字典。
+            block: 注入的上下文文本。
+        """
+
+        config = self.config
+        group_id = group_id_of(message)
+        if not block and self._buffer is not None:
+            block = render_context(
+                self._buffer.recent(session_id, config.context.size),
+                prefix=config.context.prefix,
+                note=config.reply.force_note if config.reply.force else "",
+                max_total_chars=config.context.max_total_chars,
+                message_max_chars=config.context.message_max_chars,
+            )
+        if not block.strip():
+            return
+        try:
+            result = await asyncio.wait_for(
+                self.ctx.maisaka.reply.generate(
+                    session_id,
+                    block,
+                    format_instruction=config.reply.fallback_instruction,
+                    timeout_ms=60000,
+                ),
+                timeout=90.0,
+            )
+        except Exception as exc:  # noqa: BLE001 - 生成失败只记日志
+            self._get_logger().warning("群 %s 兜底回复生成失败: %s", group_id, exc)
+            return
+        if not isinstance(result, dict) or not result.get("success"):
+            error = result.get("error") if isinstance(result, dict) else result
+            self._get_logger().warning("群 %s 兜底回复生成失败: %s", group_id, error)
+            return
+        text = str(result.get("text") or "").strip()
+        if not text:
+            self._get_logger().warning("群 %s 兜底回复为空文本，已放弃", group_id)
+            return
+        if len(text) > 2000:
+            text = text[:1999] + "…"
+        await self._ensure_session(message)
+        try:
+            sent = await asyncio.wait_for(self.ctx.send.text(text, session_id), timeout=15.0)
+        except Exception as exc:  # noqa: BLE001 - 发送失败只记日志
+            self._get_logger().warning("群 %s 兜底回复发送失败: %s", group_id, exc)
+            return
+        if sent is False:
+            self._get_logger().warning("群 %s 兜底回复发送失败（宿主返回 False）", group_id)
+            return
+        self._get_logger().info(
+            "群 %s 在 %d 秒内没有回复 @，已由插件调用 Replyer 补发一条回复",
+            group_id,
+            int(config.reply.fallback_seconds),
+        )
+
     async def _toggle(self, action: str, message: Dict[str, Any]) -> None:
         """执行白名单增删并回复确认。
 
@@ -1738,6 +2077,8 @@ class AtGatePlugin(MaiBotPlugin):
     def _permitted(self, user_id: str) -> bool:
         """判断操作者是否有权修改白名单。
 
+        兼容旧版配置：``anyone`` 等同于 ``all``，``list`` 等同于 ``admin``。
+
         Args:
             user_id: 操作者 QQ 号。
 
@@ -1746,14 +2087,18 @@ class AtGatePlugin(MaiBotPlugin):
         """
 
         config = self.config
-        mode = str(config.permission.mode or "anyone").strip().lower()
-        if mode != "list":
-            return True
-        allowed = {str(item).strip() for item in config.permission.users if str(item).strip()}
-        if not allowed:
-            self._get_logger().warning("permission.mode=list 但 permission.users 为空，已拒绝所有白名单命令")
-            return False
-        return bool(user_id) and user_id in allowed
+        mode = str(config.permission.mode or "all").strip().lower()
+        if mode in ("admin", "list"):
+            allowed = {normalize_qq(item) for item in list(config.permission.admins or []) if normalize_qq(item)}
+            if not allowed:
+                self._get_logger().warning(
+                    "permission.mode=admin 但 permission.admins 为空，已拒绝所有白名单命令"
+                )
+                return False
+            return bool(user_id) and normalize_qq(user_id) in allowed
+        if mode not in ("all", "anyone"):
+            self._get_logger().warning("permission.mode=%s 不是已知取值，已按 all 处理", mode)
+        return True
 
     async def _save_whitelist_locked(self) -> None:
         """在已持有变更锁的前提下把白名单落盘（调用方负责加锁）。"""
