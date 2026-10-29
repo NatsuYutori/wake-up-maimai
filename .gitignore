@@ -1,0 +1,6 @@
+# 运行时生成的配置（由 MaiBot 依据 config_model 写出），不纳入版本管理
+config.toml
+
+__pycache__/
+*.py[cod]
+.venv/

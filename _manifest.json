@@ -1,0 +1,47 @@
+{
+  "manifest_version": 2,
+  "id": "github.natsuyutori.wake-up-maimai",
+  "version": "1.0.0",
+  "name": "苏醒吧麦麦！",
+  "description": "控制麦麦为默认回复only@，添加到白名单群聊正常回复",
+  "author": {
+    "name": "Natsuhi Seishio",
+    "url": "https://github.com/NatsuYutori"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/NatsuYutori/wake-up-maimai",
+    "homepage": "https://github.com/NatsuYutori/wake-up-maimai",
+    "documentation": "https://github.com/NatsuYutori/wake-up-maimai/blob/main/README.md",
+    "issues": "https://github.com/NatsuYutori/wake-up-maimai/issues"
+  },
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "1.3.99"
+  },
+  "sdk": {
+    "min_version": "2.8.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "plugin_type": "management",
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "assets/icon.svg",
+      "fallback": "shield-check",
+      "background": "#1f2937"
+    }
+  },
+  "capabilities": [
+    "send.text",
+    "chat.open_session",
+    "maisaka.context.append"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}

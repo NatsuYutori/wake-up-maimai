@@ -1,0 +1,273 @@
+{
+  "schema_version": 2,
+  "required_capabilities": [
+    "declarative_basic"
+  ],
+  "workspace_title": "苏醒吧麦麦！",
+  "pages": [
+    {
+      "id": "whitelist",
+      "mode": "declarative",
+      "title": "白名单管理",
+      "description": "默认所有群只响应 @ 消息；把群加入白名单后插件退出该群，麦麦按原生逻辑主动参与聊天。这里与群内 @麦麦 /on、/off 改的是同一份数据。",
+      "placement": "workspace",
+      "icon": "list",
+      "queries": {
+        "snapshot": {
+          "api": "webui_whitelist_snapshot",
+          "version": "1"
+        }
+      },
+      "actions": {
+        "add": {
+          "api": "webui_add_group",
+          "version": "1",
+          "parameters": {
+            "group_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 20
+            },
+            "group_name": {
+              "type": "string",
+              "required": false,
+              "max_length": 64
+            },
+            "note": {
+              "type": "string",
+              "required": false,
+              "max_length": 128
+            }
+          }
+        },
+        "remove": {
+          "api": "webui_remove_group",
+          "version": "1",
+          "parameters": {
+            "group_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 20
+            }
+          },
+          "arguments": {
+            "group_id": {
+              "scope": "selection",
+              "source": "groupRow",
+              "field": "group_id"
+            }
+          },
+          "confirmation": "确认将该群移出白名单？移出后该群恢复「只响应 @」模式。"
+        },
+        "clear": {
+          "api": "webui_clear_whitelist",
+          "version": "1",
+          "confirmation": "确认清空全部白名单？清空后所有群都会恢复「只响应 @」模式。"
+        },
+        "clear_cache": {
+          "api": "webui_clear_cache",
+          "version": "1",
+          "confirmation": "确认清空上下文缓存？清空后下次 @ 麦麦时暂无历史可注入。"
+        }
+      },
+      "content": [
+        {
+          "type": "grid",
+          "columns": 3,
+          "children": [
+            {
+              "type": "stat",
+              "label": "白名单群数",
+              "value": {
+                "source": "snapshot",
+                "field": "count"
+              }
+            },
+            {
+              "type": "stat",
+              "label": "缓存会话数",
+              "value": {
+                "source": "snapshot",
+                "field": "cache_session_count"
+              }
+            },
+            {
+              "type": "stat",
+              "label": "缓存消息数",
+              "value": {
+                "source": "snapshot",
+                "field": "cache_message_count"
+              }
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "添加群到白名单",
+          "children": [
+            {
+              "type": "grid",
+              "columns": 3,
+              "children": [
+                {
+                  "type": "input",
+                  "name": "group_id",
+                  "label": "群号（必填）",
+                  "value": ""
+                },
+                {
+                  "type": "input",
+                  "name": "group_name",
+                  "label": "群名（可选，便于辨认）",
+                  "value": ""
+                },
+                {
+                  "type": "input",
+                  "name": "note",
+                  "label": "备注（可选）",
+                  "value": ""
+                }
+              ]
+            },
+            {
+              "type": "button",
+              "label": "加入白名单",
+              "action": "add"
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "value": "白名单为空：当前所有群都处于「只响应 @」模式（非 @ 消息会被丢弃）。",
+          "when": {
+            "reference": {
+              "source": "snapshot",
+              "field": "groups"
+            },
+            "operator": "empty"
+          }
+        },
+        {
+          "type": "table",
+          "label": "当前白名单（点击一行查看详情，可在详情里移出）",
+          "value": {
+            "source": "snapshot",
+            "field": "groups"
+          },
+          "when": {
+            "reference": {
+              "source": "snapshot",
+              "field": "groups"
+            },
+            "operator": "not_empty"
+          },
+          "selection": "groupRow",
+          "detail": "groupDetails",
+          "columns": [
+            {
+              "field": "group_id",
+              "label": "群号"
+            },
+            {
+              "field": "group_name",
+              "label": "群名"
+            },
+            {
+              "field": "added_by_label",
+              "label": "来源"
+            },
+            {
+              "field": "added_at",
+              "label": "加入时间"
+            }
+          ]
+        },
+        {
+          "type": "dialog",
+          "name": "groupDetails",
+          "label": "白名单详情",
+          "children": [
+            {
+              "type": "text",
+              "label": "群号",
+              "value": {
+                "scope": "selection",
+                "source": "groupRow",
+                "field": "group_id"
+              }
+            },
+            {
+              "type": "text",
+              "label": "群名",
+              "value": {
+                "scope": "selection",
+                "source": "groupRow",
+                "field": "group_name"
+              }
+            },
+            {
+              "type": "text",
+              "label": "来源",
+              "value": {
+                "scope": "selection",
+                "source": "groupRow",
+                "field": "added_by_label"
+              }
+            },
+            {
+              "type": "text",
+              "label": "加入时间",
+              "value": {
+                "scope": "selection",
+                "source": "groupRow",
+                "field": "added_at"
+              }
+            },
+            {
+              "type": "text",
+              "label": "备注",
+              "value": {
+                "scope": "selection",
+                "source": "groupRow",
+                "field": "note"
+              }
+            },
+            {
+              "type": "button",
+              "label": "移出白名单",
+              "action": "remove",
+              "variant": "danger"
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "维护操作",
+          "children": [
+            {
+              "type": "button",
+              "label": "清空白名单",
+              "action": "clear",
+              "variant": "danger"
+            },
+            {
+              "type": "button",
+              "label": "清空上下文缓存",
+              "action": "clear_cache"
+            }
+          ]
+        },
+        {
+          "type": "collapsible",
+          "label": "这一页和群内命令的关系",
+          "children": [
+            {
+              "type": "text",
+              "value": "群内 @麦麦 /on、/off 与这里的增删改的是同一份白名单数据，任何一边操作都会立即生效并持久化到插件数据目录。默认所有群不在白名单：非 @ 消息被丢弃，@ 时把该群最近 20 条消息（插件自建缓存，非宿主数据库）注入 Maisaka 上下文。"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
