@@ -1217,6 +1217,85 @@ class TestForceReply(PluginTestCase):
         self.run_loaded(scenario)
 
 
+class TestSdkCapabilityGuard(unittest.TestCase):
+    """SDK 能力探测：老版本 SDK 没有 maisaka.reply 时要显式降级，不能靠异常背锅。"""
+
+    def setUp(self) -> None:
+        """准备临时目录与「缺能力」的上下文。"""
+
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.data_dir = Path(self._temp.name)
+
+        self.plugin = atgate.AtGatePlugin()
+        self.ctx = FakeContext(self.data_dir)
+        # 模拟 SDK 2.8.0–2.15.x：MaisakaCapability 只有 context / proactive
+        del self.ctx.maisaka.reply
+        self.plugin._set_context(self.ctx)
+        self.plugin.set_plugin_config(self.plugin.get_default_config())
+
+    def test_helper_detects_missing_capability(self) -> None:
+        """能力探测函数按 reply.generate 是否可调用来判断。"""
+
+        with_reply = FakeContext(self.data_dir)
+        self.assertTrue(atgate.has_reply_capability(with_reply))
+        self.assertFalse(atgate.has_reply_capability(self.ctx))
+
+        class Bare:
+            """完全没有 maisaka 属性的上下文。"""
+
+        self.assertFalse(atgate.has_reply_capability(Bare()))
+
+    def test_fallback_not_armed_without_capability(self) -> None:
+        """缺能力时不挂兜底任务，但 @ 消息仍然放行（提示词层强制保留）。"""
+
+        async def scenario() -> None:
+            await self.plugin.on_load()
+            try:
+                result = await self.plugin.handle_incoming_message(
+                    message=make_message("在吗", is_at=True, at=[BOT_QQ])
+                )
+                self.assertIsNone(result)
+                self.assertEqual(self.plugin._force_tokens, {})
+                self.assertEqual(self.plugin._force_tasks, {})
+                snapshot = await self.plugin.webui_whitelist_snapshot()
+                self.assertTrue(snapshot["force_reply"])
+                self.assertFalse(snapshot["force_fallback"])
+                self.assertFalse(snapshot["force_fallback_available"])
+            finally:
+                await self.plugin.on_unload()
+
+        asyncio.run(scenario())
+
+    def test_generate_without_capability_sends_nothing(self) -> None:
+        """即使绕过挂载直接调用生成，也只记 ERROR、不发消息、不抛异常。"""
+
+        async def scenario() -> None:
+            await self.plugin.on_load()
+            try:
+                await self.plugin._force_generate_and_send(SESSION_ID, make_message(), "上下文块")
+                self.assertEqual(self.ctx.send.sent, [])
+            finally:
+                await self.plugin.on_unload()
+
+        asyncio.run(scenario())
+
+    def test_capability_probe_is_cached(self) -> None:
+        """探测结果只初始化一次，后续调用不再重复告警。"""
+
+        async def scenario() -> None:
+            await self.plugin.on_load()
+            try:
+                self.assertFalse(self.plugin._reply_capability_available_now())
+                self.ctx.maisaka.reply = FakeReplier()
+                # 已缓存 False，不会因为运行期补上属性而改变
+                self.assertFalse(self.plugin._reply_capability_available_now())
+            finally:
+                await self.plugin.on_unload()
+
+        asyncio.run(scenario())
+
+
 class TestAutoOff(PluginTestCase):
     """自动关闭：到点自动 /off 并发送提示。"""
 

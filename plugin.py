@@ -17,6 +17,9 @@
   ``@名片`` 前缀，``^/on$`` 匹配不到 ``@麦麦 /on``，因此在 Hook 内自行解析。
 - 群会话 ``session_id`` 只由 platform/account_id/scope/group_id 决定，与发送者无关，因此可以先用
   ``chat.open_session`` 建出与后续消息完全相同的会话，再向其中注入上下文或发送回执。
+- SDK 依赖：``maisaka.reply.generate`` 自插件 SDK 2.16.0 才提供（manifest 已声明 ``sdk.min_version``）。
+  但 MaiBot 1.3.x 对该不匹配只告警放行，故运行期再探测一次 ``ctx.maisaka.reply``：缺失时打 ERROR、
+  不挂兜底任务，只保留提示词层强制，避免 ``AttributeError`` 被兜底逻辑吞成静默失效。
 """
 
 from __future__ import annotations
@@ -842,6 +845,24 @@ def _trim_text(value: Any, limit: int) -> str:
     return str(value or "").strip()[:limit]
 
 
+def has_reply_capability(ctx: Any) -> bool:
+    """判断当前 SDK 宿主是否提供 ``maisaka.reply.generate`` 能力。
+
+    该能力随插件 SDK 2.16.0 引入（2.8.0–2.15.x 的 ``MaisakaCapability`` 只有
+    ``context`` 与 ``proactive``），缺失时调用会抛 ``AttributeError``。
+
+    Args:
+        ctx: 插件上下文。
+
+    Returns:
+        bool: 能力是否可用。
+    """
+
+    maisaka = getattr(ctx, "maisaka", None)
+    reply = getattr(maisaka, "reply", None)
+    return callable(getattr(reply, "generate", None))
+
+
 def _source_label(source: str, user_id: str) -> str:
     """把白名单来源渲染成中文标签。
 
@@ -1495,6 +1516,8 @@ class AtGatePlugin(MaiBotPlugin):
         self._last_outbound_at: Dict[str, float] = {}
         # 自动关闭检查任务
         self._auto_off_task: Optional[asyncio.Task] = None
+        # 当前 SDK 是否提供 maisaka.reply.generate（None = 尚未探测）
+        self._reply_capability_available: Optional[bool] = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -1536,6 +1559,11 @@ class AtGatePlugin(MaiBotPlugin):
         if pruned_groups:
             self._get_logger().info("启动时自动关闭了 %d 个已到期的白名单群", pruned_groups)
         self._auto_off_task = asyncio.create_task(self._auto_off_loop(), name="atgate-auto-off")
+        fallback_on = bool(config.reply.force and config.reply.fallback_enabled)
+        if fallback_on and not self._reply_capability_available_now():
+            fallback_label = "不可用（SDK 不提供 maisaka.reply，需 >= 2.16.0）"
+        else:
+            fallback_label = "开" if fallback_on else "关"
         self._get_logger().info(
             "苏醒吧麦麦！已加载：白名单 %d 个群，缓存 %d 个会话 / %d 条消息，注入上限 %d 条；"
             "命令权限=%s，强制回复=%s，超时兜底=%s（%d 秒），自动关闭=%s",
@@ -1545,7 +1573,7 @@ class AtGatePlugin(MaiBotPlugin):
             config.context.size,
             "admin" if str(config.permission.mode or "").strip().lower() in ("admin", "list") else "all",
             "开" if config.reply.force else "关",
-            "开" if (config.reply.force and config.reply.fallback_enabled) else "关",
+            fallback_label,
             int(config.reply.fallback_seconds),
             f"{config.auto_off.hours:g} 小时" if config.auto_off.hours > 0 else "永不",
         )
@@ -1865,7 +1893,10 @@ class AtGatePlugin(MaiBotPlugin):
             "admin_count": admin_count,
             "permission_hint": permission_hint,
             "force_reply": bool(config.reply.force),
-            "force_fallback": bool(config.reply.force and config.reply.fallback_enabled),
+            "force_fallback": bool(
+                config.reply.force and config.reply.fallback_enabled and self._reply_capability_available_now()
+            ),
+            "force_fallback_available": bool(self._reply_capability_available_now()),
             "auto_off_hours": float(config.auto_off.hours or 0.0),
             "auto_off_label": (
                 f"{config.auto_off.hours:g} 小时后自动关闭"
@@ -2142,6 +2173,23 @@ class AtGatePlugin(MaiBotPlugin):
     # 兜底强制回复：@ 之后一段时间内没有发出任何消息，就由插件补一条
     # ------------------------------------------------------------------
 
+    def _reply_capability_available_now(self) -> bool:
+        """探测 ``maisaka.reply.generate`` 是否可用；缺失时只告警一次。
+
+        Returns:
+            bool: 能力是否可用。
+        """
+
+        if self._reply_capability_available is None:
+            self._reply_capability_available = has_reply_capability(self.ctx)
+            if not self._reply_capability_available:
+                self._get_logger().error(
+                    "当前插件 SDK 不提供 maisaka.reply.generate（需要 maibot-plugin-sdk >= 2.16.0）："
+                    "「超时兜底补发」已自动禁用，被 @ 时只保留提示词层的强制回复。"
+                    "请升级插件 SDK，或接受该降级并关闭 reply.fallback_enabled 以消除本条告警。"
+                )
+        return self._reply_capability_available
+
     def _arm_force_fallback(self, message: Dict[str, Any], block: str) -> None:
         """在 @ 放行后挂一个兜底任务：超时仍未发出消息就调用 Replyer 补一条回复。
 
@@ -2154,6 +2202,8 @@ class AtGatePlugin(MaiBotPlugin):
             return
         config = self.config.reply
         if not config.force or not config.fallback_enabled:
+            return
+        if not self._reply_capability_available_now():
             return
         session_id = str(message.get("session_id") or "").strip()
         if not session_id:
@@ -2227,6 +2277,12 @@ class AtGatePlugin(MaiBotPlugin):
 
         config = self.config
         group_id = group_id_of(message)
+        if not self._reply_capability_available_now():
+            self._get_logger().error(
+                "群 %s 的兜底回复无法执行：当前 SDK 不含 maisaka.reply.generate（需 >= 2.16.0）",
+                group_id,
+            )
+            return
         if not block and self._buffer is not None:
             block = render_context(
                 self._buffer.recent(session_id, config.context.size),

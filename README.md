@@ -27,7 +27,8 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 ## 环境要求
 
 - MaiBot `1.3.x`（manifest 声明 `1.3.0`–`1.3.99`；若你用的是 1.4+，把 `_manifest.json` 里的 `host_application.max_version` 调到 `1.4.99` 即可）
-- 插件 SDK `2.8+`（MaiBot 自带）
+- 插件 SDK **`2.16.0+`**（MaiBot 自带）。下限是 `maisaka.reply.generate`（`MaisakaReplyCapability`）的引入版本：2.8.0–2.15.x 的 `MaisakaCapability` 只有 `context` 与 `proactive`，装上去插件能加载但「超时兜底补发」会失效。manifest 已把 `sdk.min_version` 声明为 `2.16.0`。
+- **注意：当前 MaiBot 1.3.x 对 SDK 版本不匹配只打 WARNING 放行**（日志里是「SDK 版本超出插件声明范围，已放行」），不会拒绝加载。所以插件自己还会在启动时探测一次能力：缺失时打一条 **ERROR**、跳过挂载兜底任务，并在 WebUI 快照里暴露 `force_fallback_available=false`；@ 消息仍照常放行、只保留提示词层强制。**不会**再出现"看着启用着、兜底却静默失效"的情况。
 - 统一 QQ 连接器 `MaiBot-SnowLuma-Adapter`（SnowLuma / NapCat），`platform = "qq"`
 - **`bot_config.toml` 的 `qq_account` 必须与适配器登录的 QQ 一致**，否则插件无法判定「这条消息 @ 的是我」
 
@@ -65,10 +66,11 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 1. **指令强制**：注入的聊天记录末尾会追加一段 `reply.force_note`（可改、可清空），明确要求"本轮必须调用 reply 工具回复这条 @ 消息，不允许沉默"。因为是在放行路径上做，消息仍走 MaiBot 正常流程（历史入库、记忆、工具都能用）。
 2. **超时兜底**：放行后插件挂一个计时器，`reply.fallback_seconds`（默认 45 秒）内该群**一条消息都没发出**，就调用宿主 Replyer（`maisaka.reply.generate`，复用麦麦人格与表达方式）生成一条简短回复，再用 `send.text` 直接发出去。兜底内容不经过 Planner，风格/记忆比正常回复略弱；把它当成"至少不会石沉大海"的保险。
 
-注意两点：
+注意三点：
 
 - 兜底是"没检测到任何出站消息"才触发，所以正常情况下不会多说话；但如果你把 `fallback_seconds` 调得很短，而麦麦恰好在那之后才回复，群里会出现两条。默认 45 秒足够覆盖正常的思考 + 打字延迟。
 - `reply.force = false` 会同时关掉这两层，回到"只放行、不保证回复"。
+- 兜底层依赖 SDK `2.16.0+` 的 `maisaka.reply.generate`。低于该版本时（宿主对 SDK 版本不匹配只告警放行），插件会在启动日志打一条 **ERROR** 并把兜底标记为不可用，只保留第 1 层，不会假装成功。
 
 ## 自动关闭（/on 之后到点自动 /off）
 
@@ -176,7 +178,7 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 | 机器人完全不回复任何消息 | 插件 `enabled` 是否为 true；该群是否在白名单（白名单群不走本插件，但 MaiBot 本身也可能因频率/策略不回复）；看日志有没有「无法确认机器人账号」 |
 | @ 了也不回复 | 日志 **ERROR「【需要处理】群 xxx 无法确认机器人账号」** 说明 `account_id` 缺失或不一致：核对 `bot_config.toml` 的 `qq_account` 与 SnowLuma 里登录的 QQ；WebUI 页面顶部也会出现同一条红色提示，列出受影响的群。也可临时把 `at_detection.unresolved` 设为 `pass` 验证 |
 | 命令没反应 | 是否 @ 了机器人；`command.on_words` 是否被改；`permission.mode=admin` 时自己是否在 `permission.admins` 里（日志会写「权限不足」，群里会收到无权限回执） |
-| 被 @ 了但还是没回复 | 先看日志有没有「已由插件调用 Replyer 补发一条回复」：有说明兜底生效了；没有则检查 `reply.force` / `reply.fallback_enabled` 是否被关、宿主是否支持 `maisaka.reply.generate` 能力（MaiBot 1.3.x 自带）；若两处都正常仍无回复，再看 `chat.reply_timing.talk_value` 是否被设为 0 |
+| 被 @ 了但还是没回复 | 先看日志有没有「已由插件调用 Replyer 补发一条回复」：有说明兜底生效了；没有则检查 `reply.force` / `reply.fallback_enabled` 是否被关；再看有没有 **ERROR「当前插件 SDK 不提供 maisaka.reply.generate（需要 >= 2.16.0）」**——有说明 SDK 太旧，兜底已被显式禁用，升级 `maibot-plugin-sdk` 即可；若都正常仍无回复，再看 `chat.reply_timing.talk_value` 是否被设为 0 |
 | 同一个 @ 收到两条回复 | 兜底超时时间太短，而麦麦在那之后才发出正常回复。把 `reply.fallback_seconds` 调大（默认 45 秒），或关掉 `reply.fallback_enabled` 只用指令强制 |
 | 被 @ 有回复但没有历史上下文 | 日志有「上下文注入失败」：首次建流失败或适配器策略拒绝；群里先随便聊几条再 @ 试试 |
 | WebUI 加群报「群号应为 5-12 位数字」 | 群号只接受数字，注意不要带空格或 `群` 字样 |
@@ -186,9 +188,9 @@ MaiBot 第三方插件（`github.natsuyutori.wake-up-maimai`）。默认**只响
 
 ```bash
 # 依赖：插件 SDK（含 pydantic）
-pip install maibot-plugin-sdk
+pip install "maibot-plugin-sdk>=2.16.0"
 
-# 单元测试（94 个用例，全部使用假宿主，不连接 MaiBot）
+# 单元测试（98 个用例，全部使用假宿主，不连接 MaiBot）
 python -m unittest discover -s tests -v
 
 # 静态检查
@@ -207,9 +209,16 @@ python -m json.tool webui.json > /dev/null
 - 被丢弃的消息不会进入 MaiBot 的任何历史、记忆、学习与统计。
 - 缓存内容只有文本与占位符，20 条窗口是插件自己的缓存，不等同于宿主完整聊天记录。
 - 兜底回复由 `maisaka.reply.generate`（Replyer 长文生成链路）产出，**不经过 Planner**，因此不会调用工具、也不会走正常 Agent 记忆检索；它只是保证"有回应"的保险，正常回复仍以 Planner 为主。
+- 兜底层要求插件 SDK `2.16.0+`（该能力自 2.16.0 引入）。低于此版本时插件会在日志明确报错并把兜底标记为不可用，而不是静默失效。
 - 自动关闭按 30 秒粒度检查，所以实际关闭时间可能比设定值晚最多 30 秒；重启瞬间已过期的群会被静默清理（不保证发出关闭提示）。
 
 ## 更新日志
+
+### 1.3.1
+- 修正 `_manifest.json` 的 `sdk.min_version`：`2.8.0` → **`2.16.0`**。原声明与实现不符——兜底层调用的 `maisaka.reply.generate`（`MaisakaReplyCapability`）直到 SDK 2.16.0 才加入，2.8.0–2.15.x 上插件能加载、但 `AttributeError` 会被兜底的 `except Exception` 吞成一条 WARNING，导致「超时兜底补发」静默失效。
+- 新增运行期能力探测（`has_reply_capability`）：MaiBot 1.3.x 对 SDK 版本不匹配只告警放行，因此插件在启动时自行探测 `maisaka.reply`；缺失时打 **ERROR**、不挂兜底任务，并在 WebUI 快照暴露 `force_fallback_available=false`，@ 消息仍正常放行、保留提示词层强制——不再靠异常背锅。
+- README 环境要求同步为 SDK `2.16.0+`，并说明「告警放行 + 运行期探测」的实际行为与排障条目。
+- 新增 4 个单元测试覆盖「缺 `maisaka.reply` 的老 SDK」场景（共 98 个）。
 
 ### 1.3.0
 - 新增「自动关闭」：`auto_off.hours`（默认 `0` = 永不关闭）设成大于 0 后，`@麦麦 /on` 加入的群到点自动移出白名单并停止自动回复，同时向该群发送 `auto_off.reply_auto_closed`。支持配置热更新重算、重启后保留到期点；WebUI 手动添加的群不参与自动关闭。
